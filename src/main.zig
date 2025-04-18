@@ -26,91 +26,10 @@ fn walkSingleThreaded(dir: *std.fs.Dir, depth: usize) std.fs.Dir.OpenError!i32 {
     return cnt;
 }
 
-fn walkWrapper(dir: *std.fs.Dir, depth: usize, dirToDestroy: *?std.fs.Dir, wg: *std.Thread.WaitGroup, mut: *std.Thread.Mutex, cnt: *i32, err: *?WalkErrorType) void {
-    defer wg.*.finish();
-    defer gpa.destroy(dirToDestroy);
-    defer dir.close();
-
-    const currCnt = walkMultiThreadedV2(dir, depth) catch |walkErr| blk: {
-        err.* = walkErr;
-        std.debug.print("Error: {any}\n", .{walkErr});
-
-        break :blk 0;
-    };
-
-    mut.*.lock();
-    cnt.* += currCnt;
-    mut.*.unlock();
-}
-
-var threadPool: std.Thread.Pool = undefined;
-fn walkMultiThreadedV2(dir: *std.fs.Dir, depth: usize) WalkErrorType!i32 {
-    var cnt: i32 = 0;
-    var it = dir.iterate();
-
-    if (depth <= 1) {
-        var wg: std.Thread.WaitGroup = std.Thread.WaitGroup{};
-        wg.reset();
-
-        var currErr: ?WalkErrorType = null;
-        var mut = std.Thread.Mutex{};
-
-        while (try it.next()) |entry| {
-            const fileName = entry.name;
-            const kind = entry.kind;
-
-            if (kind == std.fs.File.Kind.directory) {
-                const subDir = try gpa.create(?std.fs.Dir);
-                subDir.* = dir.openDir(fileName, .{ .iterate = true, .no_follow = true }) catch |err|
-                    switch (err) {
-                        error.AccessDenied => null,
-                        else => |leftoverErr| return leftoverErr,
-                    };
-
-                if (subDir.* != null) {
-                    wg.start();
-                    _ = try std.Thread.spawn(.{}, walkWrapper, .{ &subDir.*.?, depth + 1, subDir, &wg, &mut, &cnt, &currErr });
-                }
-            } else {
-                mut.lock();
-                cnt += 1;
-                mut.unlock();
-            }
-        }
-
-        wg.wait();
-        if (currErr != null) {
-            return currErr.?;
-        }
-    } else {
-        while (try it.next()) |entry| {
-            const fileName = entry.name;
-            const kind = entry.kind;
-
-            if (kind == std.fs.File.Kind.directory) {
-                var subDir: ?std.fs.Dir = dir.openDir(fileName, .{ .iterate = true, .no_follow = true }) catch |err|
-                    switch (err) {
-                        error.AccessDenied => null,
-                        else => |leftoverErr| return leftoverErr,
-                    };
-
-                if (subDir != null) {
-                    defer subDir.?.close();
-                    cnt += try walkMultiThreadedV2(&subDir.?, depth + 1);
-                }
-            } else {
-                cnt += 1;
-            }
-        }
-    }
-
-    return cnt;
-}
-
 const MyDir = struct {
-    dir: *std.fs.Dir,
+    dir: *?std.fs.Dir,
     stat: std.fs.Dir.Stat,
-    name: []const u8,
+    depth: usize,
 };
 
 fn compareDir(_: void, a: MyDir, b: MyDir) std.math.Order {
@@ -123,11 +42,12 @@ fn compareDir(_: void, a: MyDir, b: MyDir) std.math.Order {
     return std.math.Order.eq;
 }
 
-fn walkWrapperV2(dir: *std.fs.Dir, depth: usize, wg: *std.Thread.WaitGroup, mut: *std.Thread.Mutex, cnt: *i32) void {
+fn walkWrapper(dir: *?std.fs.Dir, depth: usize, wg: *std.Thread.WaitGroup, mut: *std.Thread.Mutex, cnt: *i32) void {
     defer wg.*.finish();
-    defer dir.close();
+    defer gpa.destroy(dir);
+    defer dir.*.?.close();
 
-    const currCnt = walkSingleThreaded(dir, depth) catch |walkErr| blk: {
+    const currCnt = walkSingleThreaded(&dir.*.?, depth) catch |walkErr| blk: {
         std.debug.print("Error: {any}\n", .{walkErr});
         break :blk 0;
     };
@@ -137,35 +57,44 @@ fn walkWrapperV2(dir: *std.fs.Dir, depth: usize, wg: *std.Thread.WaitGroup, mut:
     mut.*.unlock();
 }
 
-fn walkMultiThreadedV3(dir: *std.fs.Dir) !i32 {
+fn walk(dir: *std.fs.Dir) !i32 {
+    var threadPool: std.Thread.Pool = undefined;
+    try threadPool.init(std.Thread.Pool.Options{
+        .n_jobs = 10,
+        .allocator = gpa,
+    });
+
     var pq = std.PriorityQueue(
         MyDir,
         void,
         compareDir,
     ).init(gpa, void{});
 
+    var maybeDir = @as(?std.fs.Dir, dir.*);
     try pq.add(MyDir{
-        .dir = dir,
+        .dir = &maybeDir,
         .stat = try dir.stat(),
-        .name = ".",
+        .depth = 0,
     });
 
     var cnt: i32 = 0;
+    var mutex = std.Thread.Mutex{};
+
     var explored: usize = 0;
     while (explored + pq.count() < 1000 and pq.count() > 0) {
         explored += 1;
 
         const item: MyDir = pq.remove();
-        defer item.dir.close();
+        defer item.dir.*.?.close();
 
-        var it = item.dir.iterate();
+        var it = item.dir.*.?.iterate();
         while (try it.next()) |entry| {
             const fileName = entry.name;
             const kind = entry.kind;
 
             if (kind == std.fs.File.Kind.directory) {
                 const subDir = try gpa.create(?std.fs.Dir);
-                subDir.* = item.dir.openDir(fileName, .{ .iterate = true, .no_follow = true }) catch |err|
+                subDir.* = item.dir.*.?.openDir(fileName, .{ .iterate = true, .no_follow = true }) catch |err|
                     switch (err) {
                         error.AccessDenied => null,
                         else => |leftoverErr| return leftoverErr,
@@ -173,9 +102,9 @@ fn walkMultiThreadedV3(dir: *std.fs.Dir) !i32 {
 
                 if (subDir.* != null) {
                     try pq.add(MyDir{
-                        .dir = &subDir.*.?,
+                        .dir = subDir,
                         .stat = try subDir.*.?.stat(),
-                        .name = _fileName,
+                        .depth = item.depth + 1,
                     });
                 }
             } else {
@@ -191,9 +120,9 @@ fn walkMultiThreadedV3(dir: *std.fs.Dir) !i32 {
         const item = pq.remove();
 
         wg.start();
-        try threadPool.spawn(walkWrapperV2, .{
+        try threadPool.spawn(walkWrapper, .{
             item.dir,
-            0, // TODO: fix depth
+            item.depth + 1,
             &wg,
             &mutex,
             &cnt,
@@ -208,140 +137,6 @@ fn walkMultiThreadedV3(dir: *std.fs.Dir) !i32 {
 var _gpa = std.heap.GeneralPurposeAllocator(.{}){};
 var gpa = _gpa.allocator();
 const WalkErrorType = std.fs.Dir.OpenError || std.Thread.SpawnError || std.mem.Allocator.Error;
-
-const DirIter = struct {
-    deadPill: bool,
-    dir: *std.fs.Dir,
-    it: *std.fs.Dir.Iterator,
-    node: std.DoublyLinkedList.Node,
-};
-
-fn createDirIter(dir: *std.fs.Dir, it: *std.fs.Dir.Iterator) !*DirIter {
-    const item = try gpa.create(DirIter);
-    item.* = .{ .it = it, .dir = dir, .deadPill = false, .node = .{} };
-
-    return item;
-}
-
-fn createDeadPill() !*DirIter {
-    const item = try gpa.create(DirIter);
-    item.* = .{ .it = undefined, .dir = undefined, .deadPill = true, .node = .{} };
-
-    return item;
-}
-
-var activeFolders: i32 = 1;
-var mutex = std.Thread.Mutex{};
-var queueSize = std.Thread.Semaphore{};
-
-var fileCnt: i32 = 0;
-var q: std.DoublyLinkedList = std.DoublyLinkedList{};
-
-fn queueFront() *DirIter {
-    const dirIter: *DirIter = @fieldParentPtr("node", q.first.?);
-    return dirIter;
-}
-
-fn walkWorkerOperation() !i32 {
-    queueSize.wait();
-    mutex.lock();
-    const dirIter: *DirIter = queueFront();
-    _ = q.popFirst();
-    mutex.unlock();
-
-    if (dirIter.deadPill) {
-        return error.ScanIsOver;
-    }
-
-    const entry = try dirIter.it.next();
-    if (entry == null) {
-        {
-            mutex.lock();
-            defer mutex.unlock();
-
-            activeFolders -= 1;
-            if (activeFolders == 0) {
-                for (0..1000) |_| {
-                    queueSize.post();
-                    const x = try createDeadPill();
-                    q.append(&x.node);
-                }
-
-                return error.ScanIsOver;
-            }
-        }
-
-        dirIter.dir.close(); // we no longer need this directory's fd
-        return 0;
-    }
-
-    // std.debug.print("Found file {s}\n", .{entry.?.name});
-
-    if (entry.?.kind == std.fs.File.Kind.directory) {
-        const subDir: *?std.fs.Dir = try gpa.create(?std.fs.Dir);
-        subDir.* = dirIter.dir.openDir(entry.?.name, .{ .iterate = true }) catch |dirErr|
-            switch (dirErr) {
-                error.AccessDenied => null,
-                else => |leftoverErr| return leftoverErr,
-            };
-
-        if (subDir.* != null) {
-            const subDirIt = try gpa.create(std.fs.Dir.Iterator);
-            subDirIt.* = subDir.*.?.iterate();
-            var newSubDirIter = try createDirIter(&(subDir.*.?), subDirIt);
-
-            mutex.lock();
-            activeFolders += 1;
-            q.append(&newSubDirIter.node);
-            mutex.unlock();
-            queueSize.post();
-        }
-    }
-
-    mutex.lock();
-    dirIter.node = .{};
-    q.append(&dirIter.node);
-    mutex.unlock();
-    queueSize.post();
-
-    return 1;
-}
-
-fn walkWorker() void {
-    while (true) {
-        const cnt = walkWorkerOperation() catch |err| blk: {
-            if (err == error.ScanIsOver) {
-                return;
-            }
-
-            std.debug.print("Error: {any}\n", .{err});
-            break :blk 0;
-        };
-
-        mutex.lock();
-        fileCnt += cnt;
-        mutex.unlock();
-    }
-}
-
-fn walk(dir: *std.fs.Dir) !i32 {
-    var it = dir.iterate();
-    q.append(&(try createDirIter(dir, &it)).node);
-
-    // init size semaphore
-    queueSize.post();
-
-    var threads: [500]std.Thread = undefined;
-    for (0..50) |i| {
-        threads[i] = try std.Thread.spawn(.{}, walkWorker, .{});
-    }
-
-    for (0..50) |i| {
-        threads[i].join();
-    }
-
-    return fileCnt;
-}
 
 fn actionIntToString(action: std.os.windows.DWORD) []const u8 {
     switch (action) {
@@ -416,14 +211,9 @@ fn setupWatcher(path: []const u8) !void {
 }
 
 pub fn main() !void {
-    try threadPool.init(std.Thread.Pool.Options{
-        .n_jobs = 10,
-        .allocator = gpa,
-    });
-
     const path = "C:/Users/Znayko/Desktop";
     var dir = try std.fs.cwd().openDir(path, .{ .iterate = true, .no_follow = true });
 
-    const count = try walkMultiThreadedV3(&dir);
+    const count = try walk(&dir);
     std.debug.print("Total files: {}\n", .{count});
 }
