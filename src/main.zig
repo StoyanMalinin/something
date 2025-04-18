@@ -57,7 +57,7 @@ fn walkWrapper(dir: *?std.fs.Dir, depth: usize, wg: *std.Thread.WaitGroup, mut: 
     mut.*.unlock();
 }
 
-fn walk(dir: *std.fs.Dir) !i32 {
+fn walk(path: []const u8) !i32 {
     var threadPool: std.Thread.Pool = undefined;
     try threadPool.init(std.Thread.Pool.Options{
         .n_jobs = 10,
@@ -70,10 +70,12 @@ fn walk(dir: *std.fs.Dir) !i32 {
         compareDir,
     ).init(gpa, void{});
 
-    var maybeDir = @as(?std.fs.Dir, dir.*);
+    const dir = try gpa.create(?std.fs.Dir);
+    dir.* = try std.fs.cwd().openDir(path, .{ .iterate = true, .no_follow = true });
+
     try pq.add(MyDir{
-        .dir = &maybeDir,
-        .stat = try dir.stat(),
+        .dir = dir,
+        .stat = try dir.*.?.stat(),
         .depth = 0,
     });
 
@@ -212,8 +214,7 @@ fn setupWatcher(path: []const u8) !void {
 
 pub fn main() !void {
     const path = "C:/Users/Znayko/Desktop";
-    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true, .no_follow = true });
 
-    const count = try walk(&dir);
+    const count = try walk(path);
     std.debug.print("Total files: {}\n", .{count});
 }
