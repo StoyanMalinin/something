@@ -1,4 +1,5 @@
 const std = @import("std");
+const trie = @import("trie.zig");
 
 fn walkSingleThreaded(dir: *std.fs.Dir, depth: usize) std.fs.Dir.OpenError!i32 {
     var cnt: i32 = 0;
@@ -30,6 +31,7 @@ const MyDir = struct {
     dir: *?std.fs.Dir,
     stat: std.fs.Dir.Stat,
     depth: usize,
+    name: []const u8,
 };
 
 fn compareDir(_: void, a: MyDir, b: MyDir) std.math.Order {
@@ -77,6 +79,7 @@ fn walk(path: []const u8) !i32 {
         .dir = dir,
         .stat = try dir.*.?.stat(),
         .depth = 0,
+        .name = path,
     });
 
     var cnt: i32 = 0;
@@ -91,7 +94,8 @@ fn walk(path: []const u8) !i32 {
 
         var it = item.dir.*.?.iterate();
         while (try it.next()) |entry| {
-            const fileName = entry.name;
+            const fileName = try gpa.alloc(u8, entry.name.len);
+            @memcpy(fileName, entry.name);
             const kind = entry.kind;
 
             if (kind == std.fs.File.Kind.directory) {
@@ -107,6 +111,7 @@ fn walk(path: []const u8) !i32 {
                         .dir = subDir,
                         .stat = try subDir.*.?.stat(),
                         .depth = item.depth + 1,
+                        .name = fileName,
                     });
                 }
             } else {
@@ -213,8 +218,9 @@ fn setupWatcher(path: []const u8) !void {
 }
 
 pub fn main() !void {
-    const path = "C:/Users/Znayko/Desktop";
-
-    const count = try walk(path);
-    std.debug.print("Total files: {}\n", .{count});
+    var t = try trie.init();
+    try t.add("hello");
+    std.debug.print("{}\n", .{t.contains("hello")});
+    try t.remove("hello");
+    std.debug.print("{}\n", .{t.contains("hello")});
 }
