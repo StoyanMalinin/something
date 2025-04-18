@@ -12,7 +12,7 @@ const TrieMapContext = struct {
 
 const TrieMap = std.ArrayHashMap(u8, *Trie, TrieMapContext, false);
 
-const Trie = struct {
+pub const Trie = struct {
     wordCnt: usize,
     children: TrieMap,
     wordEndCnt: usize,
