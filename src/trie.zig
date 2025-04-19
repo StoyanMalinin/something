@@ -15,9 +15,9 @@ const TrieMap = std.ArrayHashMap(u8, *Trie, TrieMapContext, false);
 pub const Trie = struct {
     wordCnt: usize,
     children: TrieMap,
-    wordEndCnt: usize,
+    allocator: *std.mem.Allocator,
 
-    pub fn add(self: *Trie, word: []const u8) !void {
+    pub fn add(self: *Trie, word: []const u8) !*Trie {
         self.wordCnt += 1;
 
         var node = self;
@@ -26,20 +26,19 @@ pub const Trie = struct {
             if (child) |childNode| {
                 node = childNode;
             } else {
-                const newNode = try init();
+                const newNode = try init(self.allocator);
                 try node.children.put(c, newNode);
                 node = newNode;
             }
             node.wordCnt += 1;
         }
 
-        node.wordEndCnt += 1;
+        return node;
     }
 
     pub fn remove(self: *Trie, word: []const u8) !void {
         self.wordCnt -= 1;
         if (word.len == 0) {
-            self.wordEndCnt -= 1;
             return;
         }
 
@@ -52,30 +51,61 @@ pub const Trie = struct {
 
         if (child.?.wordCnt == 0) {
             _ = self.children.fetchSwapRemove(word[0]);
-            std.heap.page_allocator.destroy(child.?);
+            self.allocator.destroy(child.?);
         }
     }
 
-    pub fn contains(self: *Trie, word: []const u8) bool {
-        var node = self;
-        for (word) |c| {
-            const child = node.children.get(c);
-            if (child == null) {
-                return false;
-            }
-            node = child.?;
+    fn queryInternal(self: *Trie, word: []const u8, f: []const usize, matchLen: usize) usize {
+        if (matchLen == word.len) {
+            return self.wordCnt;
         }
 
-        return node.wordEndCnt > 0;
+        var cnt: usize = 0;
+        var it = self.children.iterator();
+        while (it.next()) |entry| {
+            const c = entry.key_ptr.*;
+
+            var newMatchLen = matchLen;
+            while (newMatchLen > 0 and c != word[newMatchLen]) {
+                newMatchLen = f[newMatchLen - 1];
+            }
+            if (c == word[newMatchLen]) {
+                newMatchLen += 1;
+            }
+
+            cnt += entry.value_ptr.*.queryInternal(word, f, newMatchLen);
+        }
+
+        return cnt;
+    }
+
+    pub fn query(self: *Trie, word: []const u8) !usize {
+        var f = try self.allocator.alloc(usize, word.len);
+        defer self.allocator.free(f);
+
+        f[0] = 0;
+        for (1..word.len) |i| {
+            var j = f[i - 1];
+            while (j > 0 and word[i] != word[j]) {
+                j = f[j - 1];
+            }
+            if (word[i] == word[j]) {
+                j += 1;
+            }
+
+            f[i] = j;
+        }
+
+        return self.queryInternal(word, f, 0);
     }
 };
 
-pub fn init() !*Trie {
-    const t = try std.heap.page_allocator.create(Trie);
+pub fn init(allocator: *std.mem.Allocator) !*Trie {
+    const t = try allocator.create(Trie);
     t.* = Trie{
         .wordCnt = 0,
-        .children = TrieMap.init(std.heap.page_allocator),
-        .wordEndCnt = 0,
+        .children = TrieMap.init(allocator.*),
+        .allocator = allocator,
     };
 
     return t;

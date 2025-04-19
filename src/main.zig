@@ -3,13 +3,11 @@ const fileIndex = @import("file-index.zig");
 
 var index: *fileIndex.FileIndex = undefined;
 
-fn walkSingleThreaded(dir: *std.fs.Dir, depth: usize) !i32 {
+fn walkSingleThreaded(dir: *std.fs.Dir, position: fileIndex.Position, depth: usize) !i32 {
     var cnt: i32 = 0;
     var it = dir.iterate();
     while (try it.next()) |entry| {
-        const fileName = try gpa.alloc(u8, entry.name.len);
-        @memcpy(fileName, entry.name);
-        try index.addFileName(fileName);
+        const subPosition = try index.addFileName(position, entry.name);
 
         if (entry.kind == std.fs.File.Kind.directory) {
             var subDir: ?std.fs.Dir = dir.openDir(entry.name, .{ .iterate = true, .no_follow = false }) catch |err|
@@ -20,7 +18,7 @@ fn walkSingleThreaded(dir: *std.fs.Dir, depth: usize) !i32 {
 
             if (subDir != null) {
                 defer subDir.?.close();
-                cnt += try walkSingleThreaded(&subDir.?, depth + 1);
+                cnt += try walkSingleThreaded(&subDir.?, subPosition, depth + 1);
             }
         } else {
             cnt += 1;
@@ -34,7 +32,7 @@ const MyDir = struct {
     dir: *?std.fs.Dir,
     stat: std.fs.Dir.Stat,
     depth: usize,
-    name: []const u8,
+    position: fileIndex.Position,
 };
 
 fn compareDir(_: void, a: MyDir, b: MyDir) std.math.Order {
@@ -47,12 +45,12 @@ fn compareDir(_: void, a: MyDir, b: MyDir) std.math.Order {
     return std.math.Order.eq;
 }
 
-fn walkWrapper(dir: *?std.fs.Dir, depth: usize, wg: *std.Thread.WaitGroup, mut: *std.Thread.Mutex, cnt: *i32) void {
+fn walkWrapper(dir: *?std.fs.Dir, position: fileIndex.Position, depth: usize, wg: *std.Thread.WaitGroup, mut: *std.Thread.Mutex, cnt: *i32) void {
     defer wg.*.finish();
     defer gpa.destroy(dir);
     defer dir.*.?.close();
 
-    const currCnt = walkSingleThreaded(&dir.*.?, depth) catch |walkErr| blk: {
+    const currCnt = walkSingleThreaded(&dir.*.?, position, depth) catch |walkErr| blk: {
         std.debug.print("Error: {any}\n", .{walkErr});
         break :blk 0;
     };
@@ -78,12 +76,8 @@ fn walk(path: []const u8) !i32 {
     const dir = try gpa.create(?std.fs.Dir);
     dir.* = try std.fs.cwd().openDir(path, .{ .iterate = true, .no_follow = false });
 
-    try pq.add(MyDir{
-        .dir = dir,
-        .stat = try dir.*.?.stat(),
-        .depth = 0,
-        .name = path,
-    });
+    const pathPosition = try index.addFileName(index.rootPosition(), path);
+    try pq.add(MyDir{ .dir = dir, .stat = try dir.*.?.stat(), .depth = 0, .position = pathPosition });
 
     var cnt: i32 = 0;
     var mutex = std.Thread.Mutex{};
@@ -95,17 +89,15 @@ fn walk(path: []const u8) !i32 {
         const item: MyDir = pq.remove();
         defer item.dir.*.?.close();
 
+        const position = item.position;
+
         var it = item.dir.*.?.iterate();
         while (try it.next()) |entry| {
-            const fileName = try gpa.alloc(u8, entry.name.len);
-            @memcpy(fileName, entry.name);
-            const kind = entry.kind;
+            const subPosition = try index.addFileName(position, entry.name);
 
-            try index.addFileName(fileName);
-
-            if (kind == std.fs.File.Kind.directory) {
+            if (entry.kind == std.fs.File.Kind.directory) {
                 const subDir = try gpa.create(?std.fs.Dir);
-                subDir.* = item.dir.*.?.openDir(fileName, .{ .iterate = true, .no_follow = false }) catch |err|
+                subDir.* = item.dir.*.?.openDir(entry.name, .{ .iterate = true, .no_follow = false }) catch |err|
                     switch (err) {
                         error.AccessDenied => null,
                         else => |leftoverErr| return leftoverErr,
@@ -116,7 +108,7 @@ fn walk(path: []const u8) !i32 {
                         .dir = subDir,
                         .stat = try subDir.*.?.stat(),
                         .depth = item.depth + 1,
-                        .name = fileName,
+                        .position = subPosition,
                     });
                 }
             } else {
@@ -134,6 +126,7 @@ fn walk(path: []const u8) !i32 {
         wg.start();
         try threadPool.spawn(walkWrapper, .{
             item.dir,
+            item.position,
             item.depth + 1,
             &wg,
             &mutex,
@@ -169,19 +162,8 @@ fn actionIntToEnum(action: std.os.windows.DWORD) Actions {
     }
 }
 
-fn actionIntToString(action: std.os.windows.DWORD) []const u8 {
-    switch (action) {
-        1 => return "Add",
-        2 => return "Remove",
-        3 => return "Modify",
-        4 => return "Rename (old name)",
-        5 => return "Rename (new name)",
-        else => unreachable,
-    }
-}
-
 fn getBaseFileName(path: []const u8) []const u8 {
-    const lastSlash = std.mem.lastIndexOf(u8, path, "/");
+    const lastSlash = std.mem.lastIndexOf(u8, path, "\\");
     if (lastSlash == null) {
         return path;
     }
@@ -236,6 +218,11 @@ fn setupWatcher(path: []const u8) !void {
         }
 
         var offset: usize = 0;
+
+        var eIndex: usize = 0;
+        var events = [_]*windows.FILE_NOTIFY_INFORMATION{undefined} ** 100;
+        var fileNames = [_][]const u8{undefined} ** 100;
+
         while (offset < bytesReturned) {
             offset = ((offset + 3) / 4) * 4; // Align to 4 bytes
             const fileNotifyInfo: *windows.FILE_NOTIFY_INFORMATION = @alignCast(@ptrCast(&buffer[offset]));
@@ -244,28 +231,81 @@ fn setupWatcher(path: []const u8) !void {
             const changedFileName: []u8 = @alignCast(buffer[offset .. offset + fileNotifyInfo.FileNameLength]);
             offset += fileNotifyInfo.FileNameLength;
 
-            const action = actionIntToEnum(fileNotifyInfo.Action);
-            std.debug.print("Action {} on file {s}\n", .{ action, changedFileName });
-
-            const changedBaseFileName = getBaseFileName(changedFileName);
-            switch (action) {
-                Actions.Add, Actions.RenameNewName => try index.addFileName(changedBaseFileName),
-                Actions.Remove, Actions.RenameOldName => try index.removeFileName(changedBaseFileName),
-                Actions.Modify => unreachable, // we are not subscribed to these events
-            }
+            events[eIndex] = fileNotifyInfo;
+            fileNames[eIndex] = changedFileName;
+            eIndex += 1;
         }
-        std.debug.assert(offset == bytesReturned);
+
+        // TODO: study updates more
+        // var i: usize = 0;
+        // while (i < eIndex) {
+        //     defer i += 1;
+
+        //     const action = actionIntToEnum(events[i].Action);
+        //     if (i == eIndex - 1) {
+        //         std.debug.print("Action {} on file {s}\n", .{ actionIntToEnum(events[i].Action), fileNames[i] });
+
+        //         const changedBaseFileName = getBaseFileName(fileNames[0]);
+        //         switch (action) {
+        //             Actions.Add => try index.addFileName(changedBaseFileName),
+        //             Actions.Remove => try index.removeFileName(changedBaseFileName),
+        //             else => unreachable,
+        //         }
+
+        //         continue;
+        //     }
+
+        //     const nextAction = actionIntToEnum(events[i + 1].Action);
+
+        //     if (action == Actions.RenameOldName) {
+        //         std.debug.assert(nextAction == Actions.RenameNewName);
+
+        //         // Rename
+        //         std.debug.print("Renamed {s} to {s}\n", .{ fileNames[i], fileNames[i + 1] });
+        //         i += 1;
+        //         continue;
+        //     } else if (action == Actions.RenameNewName) {
+        //         std.debug.assert(nextAction == Actions.RenameOldName);
+
+        //         // Rename
+        //         std.debug.print("Renamed {s} to {s}\n", .{ fileNames[i + 1], fileNames[i] });
+        //         i += 1;
+        //         continue;
+        //     } else if (action == Actions.Remove and nextAction == Actions.Add and
+        //         std.mem.eql(u8, getBaseFileName(fileNames[i]), getBaseFileName(fileNames[i + 1])))
+        //     {
+
+        //         // Move
+        //         std.debug.print("Moved {s} to {s}\n", .{ fileNames[i], fileNames[i + 1] });
+        //         i += 1;
+        //         continue;
+        //     } else {
+        //         std.debug.print("Action {} on file {s}\n", .{ actionIntToEnum(events[i].Action), fileNames[i] });
+
+        //         const changedBaseFileName = getBaseFileName(fileNames[0]);
+        //         switch (action) {
+        //             Actions.Add => try index.addFileName(changedBaseFileName),
+        //             Actions.Remove => try index.removeFileName(changedBaseFileName),
+        //             else => unreachable,
+        //         }
+        //     }
+
+        //     std.debug.print("Action {} on file {s}\n", .{ action, fileNames[i] });
+        //     i += 1;
+        // }
+
+        // std.debug.print("----------------------------\n", .{});
     }
 }
 
 pub fn main() !void {
-    const path = "C:/";
-    index = try fileIndex.init();
+    const path = "C:/Users/Znayko/Desktop";
+    index = try fileIndex.init(&gpa);
 
     const cnt = try walk(path);
     std.debug.print("Total files: {d}\n", .{cnt});
 
-    _ = try std.Thread.spawn(.{}, setupWatcher, .{path});
+    // _ = try std.Thread.spawn(.{}, setupWatcher, .{path});
 
     const startTime = std.time.milliTimestamp();
     const queryCnt = try index.query("boxes.cpp");
