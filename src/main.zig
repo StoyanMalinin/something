@@ -299,7 +299,7 @@ fn setupWatcher(path: []const u8) !void {
 }
 
 pub fn main() !void {
-    const path = "C:/Users/Znayko/Desktop";
+    const path = "D:/";
     index = try fileIndex.init(&gpa);
 
     const cnt = try walk(path);
@@ -311,6 +311,15 @@ pub fn main() !void {
     const queryCnt = try index.query("boxes.cpp");
     const endTime = std.time.milliTimestamp();
     std.debug.print("Matching files are {d} in {d}ms\n", .{ queryCnt, endTime - startTime });
+
+    const passsthroughCnt = index.rootPosition().scanPassthoughNodes();
+    const allCnt = index.rootPosition().scanAllNodes();
+    const ratio = @as(f64, @floatFromInt(passsthroughCnt)) / @as(f64, @floatFromInt(allCnt));
+    std.debug.print("Passthrough nodes are {d} / {d} = {d:.2}\n", .{
+        passsthroughCnt,
+        allCnt,
+        ratio,
+    });
 
     while (true) {
         std.Thread.sleep(1_000_000_000);

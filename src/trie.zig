@@ -10,26 +10,87 @@ const TrieMapContext = struct {
     }
 };
 
-const TrieMap = std.ArrayHashMap(u8, *Trie, TrieMapContext, false);
+const TrieChild = struct {
+    c: u8,
+    trie: *Trie,
+};
 
 pub const Trie = struct {
     wordCnt: usize,
-    children: TrieMap,
+    children: []const TrieChild,
     allocator: *std.mem.Allocator,
+
+    pub fn scanPassthoughNodes(self: *Trie) usize {
+        var cnt: usize = 0;
+        if (self.children.len == 1) {
+            cnt += 1;
+        }
+
+        for (self.children) |child| {
+            cnt += child.trie.scanPassthoughNodes();
+        }
+
+        return cnt;
+    }
+
+    pub fn scanAllNodes(self: *Trie) usize {
+        var cnt: usize = 1;
+        for (self.children) |child| {
+            cnt += child.trie.scanAllNodes();
+        }
+
+        return cnt;
+    }
+
+    fn getChild(self: *Trie, c: u8) ?*Trie {
+        for (self.children) |child| {
+            if (child.c == c) {
+                return child.trie;
+            }
+        }
+
+        return null;
+    }
+
+    fn putChild(self: *Trie, c: u8, child: *Trie) !void {
+        var newChildren = try self.allocator.alloc(TrieChild, self.children.len + 1);
+        for (0..self.children.len) |i| {
+            newChildren[i] = self.children[i];
+        }
+        newChildren[self.children.len] = TrieChild{ .c = c, .trie = child };
+
+        self.allocator.free(self.children);
+        self.children = newChildren;
+    }
+
+    fn removeChild(self: *Trie, c: u8) !void {
+        var newChildren = try self.allocator.alloc(TrieChild, self.children.len - 1);
+        var j: usize = 0;
+        for (self.children) |child| {
+            if (child.c != c) {
+                newChildren[j] = child;
+                j += 1;
+            }
+        }
+
+        self.allocator.free(self.children);
+        self.children = newChildren;
+    }
 
     pub fn add(self: *Trie, word: []const u8) !*Trie {
         self.wordCnt += 1;
 
         var node = self;
         for (word) |c| {
-            const child = node.children.get(c);
+            const child = node.getChild(c);
             if (child) |childNode| {
                 node = childNode;
             } else {
                 const newNode = try init(self.allocator);
-                try node.children.put(c, newNode);
+                try node.putChild(c, newNode);
                 node = newNode;
             }
+
             node.wordCnt += 1;
         }
 
@@ -61,19 +122,16 @@ pub const Trie = struct {
         }
 
         var cnt: usize = 0;
-        var it = self.children.iterator();
-        while (it.next()) |entry| {
-            const c = entry.key_ptr.*;
-
+        for (self.children) |child| {
             var newMatchLen = matchLen;
-            while (newMatchLen > 0 and c != word[newMatchLen]) {
+            while (newMatchLen > 0 and child.c != word[newMatchLen]) {
                 newMatchLen = f[newMatchLen - 1];
             }
-            if (c == word[newMatchLen]) {
+            if (child.c == word[newMatchLen]) {
                 newMatchLen += 1;
             }
 
-            cnt += entry.value_ptr.*.queryInternal(word, f, newMatchLen);
+            cnt += child.trie.queryInternal(word, f, newMatchLen);
         }
 
         return cnt;
@@ -104,9 +162,24 @@ pub fn init(allocator: *std.mem.Allocator) !*Trie {
     const t = try allocator.create(Trie);
     t.* = Trie{
         .wordCnt = 0,
-        .children = TrieMap.init(allocator.*),
+        .children = try allocator.alloc(TrieChild, 0),
         .allocator = allocator,
     };
 
     return t;
+}
+
+test "test basic add" {
+    var allocator = std.heap.page_allocator;
+    const trie = try init(&allocator);
+    defer allocator.destroy(trie);
+
+    _ = try trie.add("hello");
+    _ = try trie.add("hell");
+    _ = try trie.add("heaven");
+
+    std.debug.print("Answer for he is {d}\n", .{try trie.query("he")});
+    std.debug.assert(try trie.query("he") == 3);
+    std.debug.assert(try trie.query("hell") == 2);
+    std.debug.assert(try trie.query("hello") == 1);
 }
