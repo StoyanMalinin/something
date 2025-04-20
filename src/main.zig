@@ -66,14 +66,17 @@ fn walk(path: []const u8) !i32 {
         .n_jobs = 10,
         .allocator = gpa,
     });
+    defer threadPool.deinit();
 
     var pq = std.PriorityQueue(
         MyDir,
         void,
         compareDir,
     ).init(gpa, void{});
+    defer pq.deinit();
 
     const dir = try gpa.create(?std.fs.Dir);
+    defer gpa.destroy(dir);
     dir.* = try std.fs.cwd().openDir(path, .{ .iterate = true, .no_follow = false });
 
     const pathPosition = try index.addFileName(index.rootPosition(), path);
@@ -299,7 +302,7 @@ fn setupWatcher(path: []const u8) !void {
 }
 
 pub fn main() !void {
-    const path = "D:/";
+    const path = "C:/Users/Znayko/Desktop";
     index = try fileIndex.init(&gpa);
 
     const cnt = try walk(path);
@@ -320,6 +323,8 @@ pub fn main() !void {
         allCnt,
         ratio,
     });
+    std.debug.print("Total chars used are {d}\n", .{index.rootPosition().scanTotalCharCount()});
+    std.debug.print("Total direct data used for nodes {d}\n", .{index.rootPosition().scanSize()});
 
     while (true) {
         std.Thread.sleep(1_000_000_000);

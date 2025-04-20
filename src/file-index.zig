@@ -6,6 +6,7 @@ pub const Position = *trie.Trie;
 pub const FileIndex = struct {
     mut: std.Thread.Mutex,
     trie: *trie.Trie,
+    allocator: *std.mem.Allocator,
 
     pub fn rootPosition(self: *FileIndex) *trie.Trie {
         return self.trie;
@@ -24,6 +25,11 @@ pub const FileIndex = struct {
 
         return self.trie.query(name);
     }
+
+    pub fn deinit(self: *FileIndex) void {
+        self.trie.deinit();
+        self.allocator.destroy(self.trie);
+    }
 };
 
 pub fn init(allocator: *std.mem.Allocator) !*FileIndex {
@@ -31,6 +37,7 @@ pub fn init(allocator: *std.mem.Allocator) !*FileIndex {
     t.* = FileIndex{
         .trie = try trie.init(allocator),
         .mut = std.Thread.Mutex{},
+        .allocator = allocator,
     };
 
     return t;
