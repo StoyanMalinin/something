@@ -1,5 +1,6 @@
 const std = @import("std");
 const fileIndex = @import("file-index.zig");
+const trie = @import("trie.zig");
 
 var index: *fileIndex.FileIndex = undefined;
 
@@ -76,7 +77,6 @@ fn walk(path: []const u8) !i32 {
     defer pq.deinit();
 
     const dir = try gpa.create(?std.fs.Dir);
-    defer gpa.destroy(dir);
     dir.* = try std.fs.cwd().openDir(path, .{ .iterate = true, .no_follow = false });
 
     const pathPosition = try index.addFileName(index.rootPosition(), path);
@@ -90,6 +90,7 @@ fn walk(path: []const u8) !i32 {
         explored += 1;
 
         const item: MyDir = pq.remove();
+        defer gpa.destroy(item.dir);
         defer item.dir.*.?.close();
 
         const position = item.position;
@@ -302,7 +303,7 @@ fn setupWatcher(path: []const u8) !void {
 }
 
 pub fn main() !void {
-    const path = "C:/Users/Znayko/Desktop";
+    const path = "C:/";
     index = try fileIndex.init(&gpa);
 
     const cnt = try walk(path);
