@@ -147,10 +147,10 @@ pub const Trie = struct {
                 } else if (childInProgress.?.path.items[pathPos] == c) {
                     pathPos += 1;
                 } else { // We have a mismatch, so we need to split the node
-                    var commonPath = std.ArrayList(u8).init(self.allocator.*);
-                    try commonPath.appendSlice(childInProgress.?.path.items[0..pathPos]);
-
-                    var oldPath = std.ArrayList(u8).init(self.allocator.*);
+                    var oldPath = try std.ArrayList(u8).initCapacity(
+                        self.allocator.*,
+                        childInProgress.?.path.items.len - pathPos,
+                    );
                     try oldPath.appendSlice(childInProgress.?.path.items[pathPos..]);
 
                     const commonNode = try initWithChild(self.allocator, TrieChild{
@@ -158,11 +158,8 @@ pub const Trie = struct {
                         .trie = childInProgress.?.trie,
                     });
 
-                    childInProgress.?.path.deinit();
-                    childInProgress.?.* = TrieChild{
-                        .path = commonPath,
-                        .trie = commonNode,
-                    };
+                    childInProgress.?.path.shrinkAndFree(pathPos);
+                    childInProgress.?.trie = commonNode;
 
                     const newNode = try init(self.allocator);
                     const newChild = try commonNode.putChild(c, newNode);
@@ -184,21 +181,19 @@ pub const Trie = struct {
             // Should be a rare case unless we count the cases when an empty folder is first created
             // and then it is extended with a file inside it
 
-            var newNodePath = std.ArrayList(u8).init(self.allocator.*);
+            var newNodePath = try std.ArrayList(u8).initCapacity(
+                self.allocator.*,
+                child.path.items.len - pathPos,
+            );
             try newNodePath.appendSlice(child.path.items[pathPos..]);
-
-            var childPath = std.ArrayList(u8).init(self.allocator.*);
-            try childPath.appendSlice(child.path.items[0..pathPos]);
 
             const newNode = try initWithChild(self.allocator, TrieChild{
                 .path = newNodePath,
                 .trie = child.trie,
             });
-            child.path.deinit();
-            child.* = TrieChild{
-                .path = childPath,
-                .trie = newNode,
-            };
+
+            child.path.shrinkAndFree(pathPos);
+            child.*.trie = newNode;
 
             newNode.isFinal = true;
             return newNode;
