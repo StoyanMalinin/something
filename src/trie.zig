@@ -1,23 +1,12 @@
 const std = @import("std");
 
 const TrieChild = struct {
-    path: std.ArrayList(u8),
+    path: []const u8,
     trie: *Trie,
 };
 
-fn extendString(allocator: *std.mem.Allocator, s: []const u8, c: u8) ![]const u8 {
-    var newStr = try allocator.alloc(u8, s.len + 1);
-    for (0..s.len) |i| {
-        newStr[i] = s[i];
-    }
-    newStr[s.len] = c;
-
-    return newStr;
-}
-
 pub const Trie = struct {
     children: std.ArrayList(TrieChild),
-    allocator: *std.mem.Allocator,
     isFinal: bool,
 
     pub fn scanPassthoughNodes(self: *Trie) usize {
@@ -36,7 +25,7 @@ pub const Trie = struct {
     pub fn scanTotalCharCount(self: *Trie) usize {
         var cnt: usize = 0;
         for (self.children.items) |child| {
-            cnt += child.path.items.len;
+            cnt += child.path.len;
             cnt += child.trie.scanTotalCharCount();
         }
 
@@ -45,10 +34,10 @@ pub const Trie = struct {
 
     pub fn scanSize(self: *Trie) usize {
         var cnt: usize = @sizeOf(Trie);
-        cnt += self.children.items.len * @sizeOf(TrieChild);
+        cnt += self.children.capacity * @sizeOf(TrieChild);
 
         for (self.children.items) |child| {
-            cnt += child.path.items.len * @sizeOf(u8);
+            cnt += child.path.len * @sizeOf(u8);
             cnt += child.trie.scanSize();
         }
 
@@ -79,7 +68,7 @@ pub const Trie = struct {
 
     fn getChildPtr(self: *Trie, c: u8) ?*TrieChild {
         for (0..self.children.items.len) |i| {
-            if (self.children.items[i].path.items[0] == c) {
+            if (self.children.items[i].path[0] == c) {
                 return &self.children.items[i];
             }
         }
@@ -87,25 +76,7 @@ pub const Trie = struct {
         return null;
     }
 
-    fn findChildIndex(self: *Trie, c: u8) ?usize {
-        for (0..self.children.items.len) |i| {
-            if (self.children.items[i].path.items[0] == c) {
-                return i;
-            }
-        }
-
-        return null;
-    }
-
-    fn putChild(self: *Trie, c: u8, child: *Trie) !*TrieChild {
-        var path = std.ArrayList(u8).init(self.allocator.*);
-        try path.append(c);
-        try self.children.append(TrieChild{ .path = path, .trie = child });
-
-        return &self.children.items[self.children.items.len - 1];
-    }
-
-    pub fn add(self: *Trie, word: []const u8) !*Trie {
+    pub fn add(self: *Trie, word: []const u8, allocator: *std.mem.Allocator, stringAllocator: *std.mem.Allocator) !*Trie {
         var node = self;
 
         var childInProgress: ?*TrieChild = null;
@@ -124,18 +95,28 @@ pub const Trie = struct {
                     childInProgress = child;
                     didIPlaceIt = false;
                 } else {
-                    const newNode = try init(self.allocator);
-                    const newChild = try node.putChild(c, newNode);
+                    const remLen = word.len - @as(usize, @intCast(i));
 
-                    childInProgress = newChild;
-                    pathPos = 1;
+                    const newNode = try init(allocator);
+                    const newChildPath = try stringAllocator.alloc(u8, remLen);
+                    @memcpy(newChildPath, word[@as(usize, @intCast(i))..]);
+                    const newChild = TrieChild{
+                        .path = newChildPath,
+                        .trie = newNode,
+                    };
+                    try node.children.append(newChild);
+
+                    childInProgress = &node.children.items[node.children.items.len - 1];
+                    pathPos = remLen;
                     didIPlaceIt = true;
+
+                    i = @as(i32, @intCast(word.len)) - 1;
+                    break;
                 }
             } else {
-                if (pathPos == childInProgress.?.path.items.len) {
+                if (pathPos == childInProgress.?.path.len) {
                     if (didIPlaceIt) {
-                        try childInProgress.?.path.append(c);
-                        pathPos += 1;
+                        unreachable;
                     } else {
                         node = childInProgress.?.trie;
                         childInProgress = null;
@@ -144,36 +125,40 @@ pub const Trie = struct {
                         // Continue with the same character, but just move one level down
                         i -= 1;
                     }
-                } else if (childInProgress.?.path.items[pathPos] == c) {
+                } else if (childInProgress.?.path[pathPos] == c) {
                     pathPos += 1;
                 } else { // We have a mismatch, so we need to split the node
-                    var oldPath = try std.ArrayList(u8).initCapacity(
-                        self.allocator.*,
-                        childInProgress.?.path.items.len - pathPos,
-                    );
-                    try oldPath.appendSlice(childInProgress.?.path.items[pathPos..]);
-
-                    const commonNode = try initWithChild(self.allocator, TrieChild{
-                        .path = oldPath,
+                    const commonNode = try initWithChild(allocator, TrieChild{
+                        .path = childInProgress.?.path[pathPos..],
                         .trie = childInProgress.?.trie,
                     });
 
-                    childInProgress.?.path.shrinkAndFree(pathPos);
+                    childInProgress.?.path = childInProgress.?.path[0..pathPos];
                     childInProgress.?.trie = commonNode;
 
-                    const newNode = try init(self.allocator);
-                    const newChild = try commonNode.putChild(c, newNode);
+                    const remLen = word.len - @as(usize, @intCast(i));
+                    const newNode = try init(allocator);
+                    const newChildPath = try stringAllocator.alloc(u8, remLen);
+                    @memcpy(newChildPath, word[@as(usize, @intCast(i))..]);
+                    const newChild = TrieChild{
+                        .path = newChildPath,
+                        .trie = newNode,
+                    };
+                    try commonNode.children.append(newChild);
 
                     node = commonNode;
-                    childInProgress = newChild;
-                    pathPos = 1;
+                    childInProgress = &node.children.items[node.children.items.len - 1];
+                    pathPos = remLen;
                     didIPlaceIt = true;
+
+                    i = @as(i32, @intCast(word.len)) - 1;
+                    break;
                 }
             }
         }
 
         if (childInProgress) |child| {
-            if (pathPos == child.path.items.len) {
+            if (pathPos == child.path.len) {
                 child.trie.isFinal = true;
                 return child.trie;
             }
@@ -181,19 +166,13 @@ pub const Trie = struct {
             // Should be a rare case unless we count the cases when an empty folder is first created
             // and then it is extended with a file inside it
 
-            var newNodePath = try std.ArrayList(u8).initCapacity(
-                self.allocator.*,
-                child.path.items.len - pathPos,
-            );
-            try newNodePath.appendSlice(child.path.items[pathPos..]);
-
-            const newNode = try initWithChild(self.allocator, TrieChild{
-                .path = newNodePath,
+            const newNode = try initWithChild(allocator, TrieChild{
+                .path = child.path[pathPos..],
                 .trie = child.trie,
             });
 
-            child.path.shrinkAndFree(pathPos);
-            child.*.trie = newNode;
+            child.path = child.path[0..pathPos];
+            child.trie = newNode;
 
             newNode.isFinal = true;
             return newNode;
@@ -212,7 +191,7 @@ pub const Trie = struct {
         var cnt: usize = 0;
         for (self.children.items) |child| {
             var newMatchLen = matchLen;
-            for (child.path.items) |c| {
+            for (child.path) |c| {
                 while (newMatchLen > 0 and c != word[newMatchLen]) {
                     newMatchLen = f[newMatchLen - 1];
                 }
@@ -231,9 +210,9 @@ pub const Trie = struct {
         return cnt;
     }
 
-    pub fn query(self: *Trie, word: []const u8) !usize {
-        var f = try self.allocator.alloc(usize, word.len);
-        defer self.allocator.free(f);
+    pub fn query(self: *Trie, word: []const u8, allocator: *std.mem.Allocator) !usize {
+        var f = try allocator.alloc(usize, word.len);
+        defer allocator.free(f);
 
         f[0] = 0;
         for (1..word.len) |i| {
@@ -251,15 +230,15 @@ pub const Trie = struct {
         return self.queryInternal(word, f, 0);
     }
 
-    pub fn deinit(self: *Trie) void {
-        for (self.children.items) |child| {
-            child.path.deinit();
+    pub fn deinit(_: *Trie) void {
+        // for (self.children.items) |child| {
+        //     // child.path.deinit();
 
-            child.trie.deinit();
-            self.allocator.destroy(child.trie);
-        }
+        //     // child.trie.deinit();
+        //     // allocator.destroy(child.trie);
+        // }
 
-        self.children.deinit();
+        // self.children.deinit();
     }
 };
 
@@ -267,7 +246,6 @@ pub fn init(allocator: *std.mem.Allocator) !*Trie {
     const t = try allocator.create(Trie);
     t.* = Trie{
         .children = std.ArrayList(TrieChild).init(allocator.*),
-        .allocator = allocator,
         .isFinal = false,
     };
 
@@ -278,17 +256,11 @@ fn initWithChild(allocator: *std.mem.Allocator, child: TrieChild) !*Trie {
     const t = try allocator.create(Trie);
     t.* = Trie{
         .children = std.ArrayList(TrieChild).init(allocator.*),
-        .allocator = allocator,
         .isFinal = false,
     };
     try t.children.append(child);
 
     return t;
-}
-
-test "extend string" {
-    var allocator = std.heap.page_allocator;
-    try std.testing.expect((try extendString(&allocator, "a", 'b')).len == 2);
 }
 
 test "single add" {
