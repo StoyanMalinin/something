@@ -279,17 +279,6 @@ pub const Trie = struct {
 
         return self.queryInternal(word, f, 0);
     }
-
-    pub fn deinit(_: *Trie) void {
-        // for (self.children.items) |child| {
-        //     // child.path.deinit();
-
-        //     // child.trie.deinit();
-        //     // allocator.destroy(child.trie);
-        // }
-
-        // self.children.deinit();
-    }
 };
 
 pub fn init(allocator: *std.mem.Allocator) !*Trie {
@@ -320,7 +309,7 @@ test "single add" {
 
     _ = try trie.add("abcd", &allocator, &allocator);
 
-    try std.testing.expect(try trie.query("abcd", &allocator) == 1);
+    try std.testing.expectEqual(1, try trie.query("abcd", &allocator));
 }
 
 test "add that splits" {
@@ -331,10 +320,10 @@ test "add that splits" {
     _ = try trie.add("abcd", &allocator, &allocator);
     _ = try trie.add("abe", &allocator, &allocator);
 
-    try std.testing.expect(try trie.query("hello", &allocator) == 0);
-    try std.testing.expect(try trie.query("ab", &allocator) == 2);
-    try std.testing.expect(try trie.query("abcd", &allocator) == 1);
-    try std.testing.expect(try trie.query("abe", &allocator) == 1);
+    try std.testing.expectEqual(0, try trie.query("hello", &allocator));
+    try std.testing.expectEqual(2, try trie.query("ab", &allocator));
+    try std.testing.expectEqual(1, try trie.query("abcd", &allocator));
+    try std.testing.expectEqual(1, try trie.query("abe", &allocator));
 }
 
 test "add that is a prefix of an existing file" {
@@ -345,8 +334,8 @@ test "add that is a prefix of an existing file" {
     _ = try trie.add("hello", &allocator, &allocator);
     _ = try trie.add("hell", &allocator, &allocator);
 
-    try std.testing.expect(try trie.query("hello", &allocator) == 1);
-    try std.testing.expect(try trie.query("hell", &allocator) == 2);
+    try std.testing.expectEqual(1, try trie.query("hello", &allocator));
+    try std.testing.expectEqual(2, try trie.query("hell", &allocator));
 }
 
 test "add a string and then extend it" {
@@ -357,11 +346,11 @@ test "add a string and then extend it" {
     _ = try trie.add("hell", &allocator, &allocator);
     _ = try trie.add("hello", &allocator, &allocator);
 
-    try std.testing.expect(try trie.query("hello", &allocator) == 1);
-    try std.testing.expect(try trie.query("hell", &allocator) == 2);
+    try std.testing.expectEqual(1, try trie.query("hello", &allocator));
+    try std.testing.expectEqual(2, try trie.query("hell", &allocator));
 }
 
-test "test basic add" {
+test "basic add" {
     var allocator = std.heap.page_allocator;
     const trie = try init(&allocator);
     defer allocator.destroy(trie);
@@ -370,87 +359,24 @@ test "test basic add" {
     _ = try trie.add("hell", &allocator, &allocator);
     _ = try trie.add("heaven", &allocator, &allocator);
 
-    try std.testing.expect(try trie.query("he", &allocator) == 3);
-    try std.testing.expect(try trie.query("hell", &allocator) == 2);
-    try std.testing.expect(try trie.query("hello", &allocator) == 1);
+    try std.testing.expectEqual(3, try trie.query("he", &allocator));
+    try std.testing.expectEqual(2, try trie.query("hell", &allocator));
+    try std.testing.expectEqual(1, try trie.query("hello", &allocator));
 }
 
-pub fn memoryTest1() !void {
-    const sz = 1_000_000;
-    var _gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    var allocator = _gpa.allocator();
-
+test "add with chainining" {
+    var allocator = std.heap.page_allocator;
     const trie = try init(&allocator);
+    defer allocator.destroy(trie);
 
-    var str = try allocator.alloc(u8, sz);
-    defer allocator.free(str);
-    for (0..sz) |i| {
-        str[i] = 'a';
-    }
+    var subTrie = try trie.add("he", &allocator, &allocator);
+    _ = try subTrie.add("llo", &allocator, &allocator);
+    var subSubTrie = try subTrie.add("ro", &allocator, &allocator);
+    _ = try subSubTrie.add("ic", &allocator, &allocator);
 
-    _ = try trie.add(str);
-    std.debug.print("Done", .{});
-
-    while (true) {}
-}
-
-pub fn memoryTest2() !void {
-    const sz = 100;
-    // var _gpa = std.heap.GeneralPurposeAllocator(.{ .page_size = 512 }){};
-    var _arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    var allocator = _arena.allocator();
-
-    const trie = try init(&allocator);
-
-    var prng = std.Random.DefaultPrng.init(blk: {
-        var seed: u64 = undefined;
-        try std.posix.getrandom(std.mem.asBytes(&seed));
-        break :blk seed;
-    });
-    const rand = prng.random();
-
-    var str = try allocator.alloc(u8, sz);
-    defer allocator.free(str);
-
-    for (0..10_000) |_| {
-        for (0..sz) |i| {
-            str[i] = rand.int(u8);
-        }
-
-        _ = try trie.add(str);
-    }
-
-    std.debug.print("Done\n", .{});
-    std.debug.print("Node count: {}\n", .{trie.scanAllNodes()});
-    std.debug.print("Trie size: {}\n", .{trie.scanSize()});
-    std.debug.print("Total char count: {}\n", .{trie.scanTotalCharCount()});
-
-    trie.deinit();
-    // allocator.destroy(trie);
-    // allocator.free(str);
-
-    // _ = _gpa.detectLeaks();
-
-    while (true) {}
-}
-
-pub fn memoryTest3() !void {
-    var _gpa = std.heap.GeneralPurposeAllocator(.{ .page_size = 64 * 1024 }){};
-    var allocator = _gpa.allocator();
-
-    var prng = std.Random.DefaultPrng.init(blk: {
-        var seed: u64 = undefined;
-        try std.posix.getrandom(std.mem.asBytes(&seed));
-        break :blk seed;
-    });
-    const rand = prng.random();
-
-    for (0..20_000) |_| {
-        const str = try allocator.alloc(u8, 100);
-        for (0..100) |i| {
-            str[i] = rand.int(u8);
-        }
-    }
-
-    while (true) {}
+    try std.testing.expectEqual(4, try trie.query("h", &allocator));
+    try std.testing.expectEqual(3, try trie.query("o", &allocator));
+    try std.testing.expectEqual(1, try trie.query("hello", &allocator));
+    try std.testing.expectEqual(2, try trie.query("hero", &allocator));
+    try std.testing.expectEqual(1, try trie.query("heroic", &allocator));
 }

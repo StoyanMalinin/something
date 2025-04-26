@@ -26,11 +26,6 @@ pub const FileIndex = struct {
 
         return self.trie.query(name, self.allocator);
     }
-
-    pub fn deinit(self: *FileIndex) void {
-        self.trie.deinit();
-        self.allocator.destroy(self.trie);
-    }
 };
 
 pub fn init(allocator: *std.mem.Allocator, stringAllocator: *std.mem.Allocator) !*FileIndex {
