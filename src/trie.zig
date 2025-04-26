@@ -227,6 +227,23 @@ pub const Trie = struct {
         return node;
     }
 
+    pub fn remove(self: *Trie, word: []const u8) void {
+        const node = self.getChildPtr(word[0]);
+        if (node) |child| {
+            const len = child.path.len;
+            // TODO: assert that the characters in the path are the same as in the word
+
+            if (word.len == len) {
+                self.children.remove(&child.node);
+                // TODO: clean the memory once we have the code that copies the structure with strings with clear ownership
+            } else {
+                child.trie.remove(word[len..]);
+            }
+        } else {
+            unreachable;
+        }
+    }
+
     fn queryInternal(self: *Trie, word: []const u8, f: []const usize, matchLen: usize) usize {
         if (matchLen == word.len) {
             return self.countFinalNodes();
@@ -379,4 +396,26 @@ test "add with chainining" {
     try std.testing.expectEqual(1, try trie.query("hello", &allocator));
     try std.testing.expectEqual(2, try trie.query("hero", &allocator));
     try std.testing.expectEqual(1, try trie.query("heroic", &allocator));
+}
+
+test "remove" {
+    var allocator = std.heap.page_allocator;
+    const trie = try init(&allocator);
+    defer allocator.destroy(trie);
+
+    _ = try trie.add("he", &allocator, &allocator);
+    _ = try trie.add("hell", &allocator, &allocator);
+    _ = try trie.add("hello", &allocator, &allocator);
+    _ = try trie.add("heaven", &allocator, &allocator);
+
+    try std.testing.expectEqual(4, try trie.query("he", &allocator));
+
+    trie.remove("heaven");
+    try std.testing.expectEqual(3, try trie.query("he", &allocator));
+
+    trie.remove("hell");
+    try std.testing.expectEqual(1, try trie.query("he", &allocator));
+
+    trie.remove("he");
+    try std.testing.expectEqual(0, try trie.query("he", &allocator));
 }

@@ -26,6 +26,13 @@ pub const FileIndex = struct {
 
         return self.trie.query(name, self.allocator);
     }
+
+    pub fn removeFileName(self: *FileIndex, name: []const u8) !void {
+        self.mut.lock();
+        defer self.mut.unlock();
+
+        try self.trie.remove(name, self.allocator);
+    }
 };
 
 pub fn init(allocator: *std.mem.Allocator, stringAllocator: *std.mem.Allocator) !*FileIndex {
