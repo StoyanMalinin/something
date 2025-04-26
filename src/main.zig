@@ -308,8 +308,13 @@ pub fn main() !void {
     );
     var stringAllocator = _stringAllocator.allocator();
 
+    var _nodeAllocator = std.heap.FixedBufferAllocator.init(
+        try std.heap.page_allocator.alloc(u8, 110 * 1024 * 1024), // 100 MB
+    );
+    var nodeAllocator = _nodeAllocator.allocator();
+
     const path = "C:/";
-    index = try fileIndex.init(&gpa, &stringAllocator);
+    index = try fileIndex.init(&nodeAllocator, &stringAllocator);
 
     const cnt = try walk(path);
     std.debug.print("Total files: {d}\n", .{cnt});
