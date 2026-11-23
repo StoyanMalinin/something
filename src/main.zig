@@ -136,14 +136,11 @@ const WalkErrorType = std.Io.Dir.OpenError || std.Thread.SpawnError || std.mem.A
 
 fn onFsEvent(_: ?*anyopaque, event: watcher.Event) void {
     // TODO: apply the change to the index
-    std.debug.print("fs event: {s} created={} removed={} modified={} renamed={} dir={}\n", .{
-        event.path,
-        event.created(),
-        event.removed(),
-        event.modified(),
-        event.renamed(),
-        event.isDir(),
-    });
+    switch (event) {
+        .add => |e| std.debug.print("fs event: add {s} ({s})\n", .{ e.path, @tagName(e.kind) }),
+        .remove => |e| std.debug.print("fs event: remove {s} ({s})\n", .{ e.path, @tagName(e.kind) }),
+        .move => |e| std.debug.print("fs event: move {s} -> {s} ({s})\n", .{ e.from, e.to, @tagName(e.kind) }),
+    }
 }
 
 pub fn main(init: std.process.Init) !void {

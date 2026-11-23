@@ -217,7 +217,7 @@ pub const Trie = struct {
         return node;
     }
 
-    pub fn removeRecursive(self: *Trie, word: []const u8) ?*Trie {
+    pub fn removeRecursive(self: *Trie, word: []const u8, allocator: *std.mem.Allocator) ?*Trie {
         if (word.len == 0) return null;
 
         const node = self.getChildPtr(word[0]);
@@ -234,9 +234,11 @@ pub const Trie = struct {
                 }
 
                 self.children.remove(&child.node);
-                return child.trie;
+                const removed = child.trie;
+                allocator.destroy(child);
+                return removed;
             } else {
-                return child.trie.removeRecursive(word[len..]);
+                return child.trie.removeRecursive(word[len..], allocator);
             }
         } else {
             return null;
@@ -260,7 +262,6 @@ pub const Trie = struct {
                 }
 
                 child.trie.isFinal = false;
-                // TODO: Think if we want to reconcile the tree (as an optimization)
                 return child.trie;
             } else {
                 return child.trie.removeSingle(word[len..]);
@@ -268,6 +269,24 @@ pub const Trie = struct {
         } else {
             return null;
         }
+    }
+
+    pub fn destroyChildren(self: *Trie, allocator: *std.mem.Allocator) void {
+        var node = self.children.first;
+        while (node) |n| {
+            const child: *TrieChild = @fieldParentPtr("node", n);
+            node = n.next;
+
+            child.trie.destroy(allocator);
+            allocator.destroy(child);
+        }
+
+        self.children = .{};
+    }
+
+    pub fn destroy(self: *Trie, allocator: *std.mem.Allocator) void {
+        self.destroyChildren(allocator);
+        allocator.destroy(self);
     }
 
     fn queryInternal(self: *Trie, word: []const u8, f: []const usize, matchLen: usize) usize {
@@ -436,13 +455,13 @@ test "removeRecursive" {
 
     try std.testing.expectEqual(4, try trie.query("he", &allocator));
 
-    _ = trie.removeRecursive("heaven");
+    _ = trie.removeRecursive("heaven", &allocator);
     try std.testing.expectEqual(3, try trie.query("he", &allocator));
 
-    _ = trie.removeRecursive("hell");
+    _ = trie.removeRecursive("hell", &allocator);
     try std.testing.expectEqual(1, try trie.query("he", &allocator));
 
-    _ = trie.removeRecursive("he");
+    _ = trie.removeRecursive("he", &allocator);
     try std.testing.expectEqual(0, try trie.query("he", &allocator));
 }
 
@@ -454,12 +473,12 @@ test "removeRecursive with missing, short and empty words" {
     _ = try trie.add("hello", &allocator, &allocator);
     _ = try trie.add("heaven", &allocator, &allocator);
 
-    try std.testing.expectEqual(null, trie.removeRecursive("zzz"));
-    try std.testing.expectEqual(null, trie.removeRecursive("hex"));
-    try std.testing.expectEqual(null, trie.removeRecursive("hel"));
-    try std.testing.expectEqual(null, trie.removeRecursive(""));
+    try std.testing.expectEqual(null, trie.removeRecursive("zzz", &allocator));
+    try std.testing.expectEqual(null, trie.removeRecursive("hex", &allocator));
+    try std.testing.expectEqual(null, trie.removeRecursive("hel", &allocator));
+    try std.testing.expectEqual(null, trie.removeRecursive("", &allocator));
     // "he" is only the shared start of the two words, it must not take them along
-    try std.testing.expectEqual(null, trie.removeRecursive("he"));
+    try std.testing.expectEqual(null, trie.removeRecursive("he", &allocator));
     try std.testing.expectEqual(2, try trie.query("he", &allocator));
 }
 
