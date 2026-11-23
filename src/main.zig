@@ -1,6 +1,7 @@
 const std = @import("std");
 const fileIndex = @import("file-index.zig");
 const trie = @import("trie.zig");
+const watcher = @import("watcher.zig");
 
 var index: *fileIndex.FileIndex = undefined;
 
@@ -136,159 +137,16 @@ var gpa: std.mem.Allocator = undefined;
 var io: std.Io = undefined;
 const WalkErrorType = std.Io.Dir.OpenError || std.Thread.SpawnError || std.mem.Allocator.Error;
 
-const Actions = enum(u32) {
-    Add = 1,
-    Remove = 2,
-    Modify = 3,
-    RenameOldName = 4,
-    RenameNewName = 5,
-};
-
-fn actionIntToEnum(action: std.os.windows.DWORD) Actions {
-    switch (action) {
-        1 => return Actions.Add,
-        2 => return Actions.Remove,
-        3 => return Actions.Modify,
-        4 => return Actions.RenameOldName,
-        5 => return Actions.RenameNewName,
-        else => unreachable,
-    }
-}
-
-fn getBaseFileName(path: []const u8) []const u8 {
-    const lastSlash = std.mem.lastIndexOf(u8, path, "\\");
-    if (lastSlash == null) {
-        return path;
-    }
-
-    return path[lastSlash.? + 1 ..];
-}
-
-fn setupWatcher(path: []const u8) !void {
-    const alloc = std.heap.page_allocator;
-    const windows = std.os.windows;
-    const kernel = windows.kernel32;
-
-    const utf16Path = try std.unicode.utf8ToUtf16LeAllocZ(alloc, path);
-    defer alloc.free(utf16Path);
-
-    const handle = kernel.CreateFileW(
-        utf16Path,
-        windows.FILE_LIST_DIRECTORY,
-        windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
-        null,
-        windows.OPEN_EXISTING,
-        windows.FILE_FLAG_BACKUP_SEMANTICS | windows.FILE_FLAG_OVERLAPPED,
-        null,
-    );
-    if (handle == windows.INVALID_HANDLE_VALUE) {
-        return error.UnknownDirectory;
-    }
-    defer windows.CloseHandle(handle);
-
-    std.debug.print("Starting to watch changes in {s}\n", .{path});
-
-    // The buffer should be big enough, otherwise the events won't be populated
-    var buffer: [16 * 1024]u8 align(4) = undefined;
-    var bytesReturned: u32 = 0;
-
-    while (true) {
-        const result = kernel.ReadDirectoryChangesW(
-            handle,
-            &buffer,
-            buffer.len,
-            windows.TRUE,
-            .{ .file_name = true, .dir_name = true },
-            &bytesReturned,
-            null,
-            null,
-        );
-        if (result == 0) {
-            return error.OSIssue;
-        }
-        if (bytesReturned == 0) {
-            return error.InsufficientBuffer;
-        }
-
-        var offset: usize = 0;
-
-        var eIndex: usize = 0;
-        var events: [100]*windows.FILE_NOTIFY_INFORMATION = @splat(undefined);
-        var fileNames: [100][]const u8 = @splat(undefined);
-
-        while (offset < bytesReturned) {
-            offset = ((offset + 3) / 4) * 4; // Align to 4 bytes
-            const fileNotifyInfo: *windows.FILE_NOTIFY_INFORMATION = @alignCast(@ptrCast(&buffer[offset]));
-            offset += @sizeOf(windows.FILE_NOTIFY_INFORMATION);
-
-            const changedFileName: []u8 = @alignCast(buffer[offset .. offset + fileNotifyInfo.FileNameLength]);
-            offset += fileNotifyInfo.FileNameLength;
-
-            events[eIndex] = fileNotifyInfo;
-            fileNames[eIndex] = changedFileName;
-            eIndex += 1;
-        }
-
-        // TODO: study updates more
-        // var i: usize = 0;
-        // while (i < eIndex) {
-        //     defer i += 1;
-
-        //     const action = actionIntToEnum(events[i].Action);
-        //     if (i == eIndex - 1) {
-        //         std.debug.print("Action {} on file {s}\n", .{ actionIntToEnum(events[i].Action), fileNames[i] });
-
-        //         const changedBaseFileName = getBaseFileName(fileNames[0]);
-        //         switch (action) {
-        //             Actions.Add => try index.addFileName(changedBaseFileName),
-        //             Actions.Remove => try index.removeFileName(changedBaseFileName),
-        //             else => unreachable,
-        //         }
-
-        //         continue;
-        //     }
-
-        //     const nextAction = actionIntToEnum(events[i + 1].Action);
-
-        //     if (action == Actions.RenameOldName) {
-        //         std.debug.assert(nextAction == Actions.RenameNewName);
-
-        //         // Rename
-        //         std.debug.print("Renamed {s} to {s}\n", .{ fileNames[i], fileNames[i + 1] });
-        //         i += 1;
-        //         continue;
-        //     } else if (action == Actions.RenameNewName) {
-        //         std.debug.assert(nextAction == Actions.RenameOldName);
-
-        //         // Rename
-        //         std.debug.print("Renamed {s} to {s}\n", .{ fileNames[i + 1], fileNames[i] });
-        //         i += 1;
-        //         continue;
-        //     } else if (action == Actions.Remove and nextAction == Actions.Add and
-        //         std.mem.eql(u8, getBaseFileName(fileNames[i]), getBaseFileName(fileNames[i + 1])))
-        //     {
-
-        //         // Move
-        //         std.debug.print("Moved {s} to {s}\n", .{ fileNames[i], fileNames[i + 1] });
-        //         i += 1;
-        //         continue;
-        //     } else {
-        //         std.debug.print("Action {} on file {s}\n", .{ actionIntToEnum(events[i].Action), fileNames[i] });
-
-        //         const changedBaseFileName = getBaseFileName(fileNames[0]);
-        //         switch (action) {
-        //             Actions.Add => try index.addFileName(changedBaseFileName),
-        //             Actions.Remove => try index.removeFileName(changedBaseFileName),
-        //             else => unreachable,
-        //         }
-        //     }
-
-        //     std.debug.print("Action {} on file {s}\n", .{ action, fileNames[i] });
-        //     i += 1;
-        // }
-
-        // std.debug.print("----------------------------\n", .{});
-    }
+fn onFsEvent(_: ?*anyopaque, event: watcher.Event) void {
+    // TODO: apply the change to the index
+    std.debug.print("fs event: {s} created={} removed={} modified={} renamed={} dir={}\n", .{
+        event.path,
+        event.created(),
+        event.removed(),
+        event.modified(),
+        event.renamed(),
+        event.isDir(),
+    });
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -300,16 +158,19 @@ pub fn main(init: std.process.Init) !void {
     );
     var stringAllocator = _stringAllocator.allocator();
 
-    const path = "C:/";
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const path = if (args.len > 1) args[1] else "/";
+    const needle = if (args.len > 2) args[2] else "boxes.cpp";
     index = try fileIndex.init(&gpa, &stringAllocator, io);
 
     const cnt = try walk(path);
     std.debug.print("Total files: {d}\n", .{cnt});
 
-    // _ = try std.Thread.spawn(.{}, setupWatcher, .{path});
+    const fsWatcher = try watcher.Watcher.start(gpa, path, 0.1, onFsEvent, null);
+    defer fsWatcher.stop(gpa);
 
     const startTime = std.Io.Clock.awake.now(io);
-    const queryCnt = try index.query("boxes.cpp");
+    const queryCnt = try index.query(needle);
     const endTime = std.Io.Clock.awake.now(io);
     std.debug.print("Matching files are {d} in {d}ms\n", .{ queryCnt, startTime.durationTo(endTime).toMilliseconds() });
 

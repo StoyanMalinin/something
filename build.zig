@@ -26,6 +26,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // FSEvents (macOS file system change notifications) comes from CoreServices.
+    const c_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const c_mod = c_translate.createModule();
+    c_mod.linkFramework("CoreServices", .{});
+    exe_mod.addImport("c", c_mod);
+
     // This creates another `std.Build.Step.Compile`, but this one builds an executable
     // rather than a static library.
     const exe = b.addExecutable(.{
