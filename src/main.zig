@@ -5,11 +5,11 @@ const watcher = @import("watcher.zig");
 
 var index: *fileIndex.FileIndex = undefined;
 
-fn walkSingleThreaded(dir: *std.Io.Dir, position: fileIndex.Position, depth: usize) !i32 {
+fn walkSingleThreaded(dir: *std.Io.Dir, position: fileIndex.Position) !i32 {
     var cnt: i32 = 0;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
-        const subPosition = try index.addFileName(position, entry.name);
+        const subPosition = try index.addFileName(position, entry.name, entry.kind == std.Io.File.Kind.directory);
 
         if (entry.kind == std.Io.File.Kind.directory) {
             var subDir: ?std.Io.Dir = dir.openDir(io, entry.name, .{ .iterate = true }) catch |err|
@@ -20,7 +20,7 @@ fn walkSingleThreaded(dir: *std.Io.Dir, position: fileIndex.Position, depth: usi
 
             if (subDir != null) {
                 defer subDir.?.close(io);
-                cnt += try walkSingleThreaded(&subDir.?, subPosition, depth + 1);
+                cnt += try walkSingleThreaded(&subDir.?, subPosition);
             }
         } else {
             cnt += 1;
@@ -33,7 +33,6 @@ fn walkSingleThreaded(dir: *std.Io.Dir, position: fileIndex.Position, depth: usi
 const MyDir = struct {
     dir: *?std.Io.Dir,
     stat: std.Io.Dir.Stat,
-    depth: usize,
     position: fileIndex.Position,
 };
 
@@ -47,11 +46,11 @@ fn compareDir(_: void, a: MyDir, b: MyDir) std.math.Order {
     return std.math.Order.eq;
 }
 
-fn walkWrapper(dir: *?std.Io.Dir, position: fileIndex.Position, depth: usize, mut: *std.Io.Mutex, cnt: *i32) void {
+fn walkWrapper(dir: *?std.Io.Dir, position: fileIndex.Position, mut: *std.Io.Mutex, cnt: *i32) void {
     defer gpa.destroy(dir);
     defer dir.*.?.close(io);
 
-    const currCnt = walkSingleThreaded(&dir.*.?, position, depth) catch |walkErr| blk: {
+    const currCnt = walkSingleThreaded(&dir.*.?, position) catch |walkErr| blk: {
         std.debug.print("Error: {any}\n", .{walkErr});
         break :blk 0;
     };
@@ -72,8 +71,8 @@ fn walk(path: []const u8) !i32 {
     const dir = try gpa.create(?std.Io.Dir);
     dir.* = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
 
-    const pathPosition = try index.addFileName(index.rootPosition(), path);
-    try pq.push(gpa, MyDir{ .dir = dir, .stat = try dir.*.?.stat(io), .depth = 0, .position = pathPosition });
+    const pathPosition = try index.addFileName(index.rootPosition(), path, true);
+    try pq.push(gpa, MyDir{ .dir = dir, .stat = try dir.*.?.stat(io), .position = pathPosition });
 
     var cnt: i32 = 0;
     var mutex: std.Io.Mutex = .init;
@@ -90,7 +89,7 @@ fn walk(path: []const u8) !i32 {
 
         var it = item.dir.*.?.iterate();
         while (try it.next(io)) |entry| {
-            const subPosition = try index.addFileName(position, entry.name);
+            const subPosition = try index.addFileName(position, entry.name, entry.kind == std.Io.File.Kind.directory);
 
             if (entry.kind == std.Io.File.Kind.directory) {
                 const subDir = try gpa.create(?std.Io.Dir);
@@ -104,7 +103,6 @@ fn walk(path: []const u8) !i32 {
                     try pq.push(gpa, MyDir{
                         .dir = subDir,
                         .stat = try subDir.*.?.stat(io),
-                        .depth = item.depth + 1,
                         .position = subPosition,
                     });
                 }
@@ -122,7 +120,6 @@ fn walk(path: []const u8) !i32 {
         group.async(io, walkWrapper, .{
             item.dir,
             item.position,
-            item.depth + 1,
             &mutex,
             &cnt,
         });

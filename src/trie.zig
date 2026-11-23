@@ -114,24 +114,37 @@ pub const Trie = struct {
         self.children.prepend(&child.node);
     }
 
+    fn splitChild(allocator: *std.mem.Allocator, child: *TrieChild, splitPos: usize) !*Trie {
+        const newChild = try allocator.create(TrieChild);
+        newChild.* = TrieChild{
+            .path = child.path[splitPos..],
+            .trie = child.trie,
+        };
+
+        const newNode = try initWithChild(allocator, newChild);
+
+        child.path = child.path[0..splitPos];
+        child.trie = newNode;
+
+        return newNode;
+    }
+
     pub fn add(self: *Trie, word: []const u8, allocator: *std.mem.Allocator, stringAllocator: *std.mem.Allocator) !*Trie {
         var node = self;
 
         var childInProgress: ?*TrieChild = null;
         var pathPos: usize = 0;
-        var didIPlaceIt = false;
 
         var i: i32 = 0;
         while (i < word.len) {
             defer i += 1;
 
-            const c = word[@as(usize, @intCast(i))];
+            const c = word[@intCast(i)];
 
             if (pathPos == 0) {
                 if (node.getChildPtr(c)) |child| {
                     pathPos += 1;
                     childInProgress = child;
-                    didIPlaceIt = false;
                 } else {
                     const remLen = word.len - @as(usize, @intCast(i));
 
@@ -147,35 +160,22 @@ pub const Trie = struct {
 
                     childInProgress = newChild;
                     pathPos = remLen;
-                    didIPlaceIt = true;
 
                     i = @as(i32, @intCast(word.len)) - 1;
                     break;
                 }
             } else {
                 if (pathPos == childInProgress.?.path.len) {
-                    if (didIPlaceIt) {
-                        unreachable;
-                    } else {
-                        node = childInProgress.?.trie;
-                        childInProgress = null;
-                        pathPos = 0;
+                    node = childInProgress.?.trie;
+                    childInProgress = null;
+                    pathPos = 0;
 
-                        // Continue with the same character, but just move one level down
-                        i -= 1;
-                    }
+                    // Continue with the same character, but just move one level down
+                    i -= 1;
                 } else if (childInProgress.?.path[pathPos] == c) {
                     pathPos += 1;
                 } else { // We have a mismatch, so we need to split the node
-                    const commonNodeChild = try allocator.create(TrieChild);
-                    commonNodeChild.* = TrieChild{
-                        .path = childInProgress.?.path[pathPos..],
-                        .trie = childInProgress.?.trie,
-                    };
-                    const commonNode = try initWithChild(allocator, commonNodeChild);
-
-                    childInProgress.?.path = childInProgress.?.path[0..pathPos];
-                    childInProgress.?.trie = commonNode;
+                    const commonNode = try splitChild(allocator, childInProgress.?, pathPos);
 
                     const remLen = word.len - @as(usize, @intCast(i));
                     const newNode = try init(allocator);
@@ -191,7 +191,6 @@ pub const Trie = struct {
                     node = commonNode;
                     childInProgress = newChild;
                     pathPos = remLen;
-                    didIPlaceIt = true;
 
                     i = @as(i32, @intCast(word.len)) - 1;
                     break;
@@ -205,20 +204,11 @@ pub const Trie = struct {
                 return child.trie;
             }
 
-            // Should be a rare case unless we count the cases when an empty folder is first created
-            // and then it is extended with a file inside it
+            // We are a proper prefix of an existing child, so we need to split
 
-            const newChild = try allocator.create(TrieChild);
-            newChild.* = TrieChild{
-                .path = child.path[pathPos..],
-                .trie = child.trie,
-            };
-            const newNode = try initWithChild(allocator, newChild);
-
-            child.path = child.path[0..pathPos];
-            child.trie = newNode;
-
+            const newNode = try splitChild(allocator, child, pathPos);
             newNode.isFinal = true;
+
             return newNode;
         } else {
             unreachable;
@@ -227,20 +217,56 @@ pub const Trie = struct {
         return node;
     }
 
-    pub fn remove(self: *Trie, word: []const u8) void {
+    pub fn removeRecursive(self: *Trie, word: []const u8) ?*Trie {
+        if (word.len == 0) return null;
+
         const node = self.getChildPtr(word[0]);
         if (node) |child| {
             const len = child.path.len;
-            // TODO: assert that the characters in the path are the same as in the word
+            if (!std.mem.startsWith(u8, word, child.path)) {
+                return null;
+            }
 
             if (word.len == len) {
+                // Only an intermediate node of the trie, the word itself was never added (or is already gone)
+                if (!child.trie.isFinal) {
+                    return null;
+                }
+
                 self.children.remove(&child.node);
-                // TODO: clean the memory once we have the code that copies the structure with strings with clear ownership
+                return child.trie;
             } else {
-                child.trie.remove(word[len..]);
+                return child.trie.removeRecursive(word[len..]);
             }
         } else {
-            unreachable;
+            return null;
+        }
+    }
+
+    pub fn removeSingle(self: *Trie, word: []const u8) ?*Trie {
+        if (word.len == 0) return null;
+
+        const node = self.getChildPtr(word[0]);
+        if (node) |child| {
+            const len = child.path.len;
+            if (!std.mem.startsWith(u8, word, child.path)) {
+                return null;
+            }
+
+            if (word.len == len) {
+                // Only an intermediate node of the trie, the word itself was never added (or is already gone)
+                if (!child.trie.isFinal) {
+                    return null;
+                }
+
+                child.trie.isFinal = false;
+                // TODO: Think if we want to reconcile the tree (as an optimization)
+                return child.trie;
+            } else {
+                return child.trie.removeSingle(word[len..]);
+            }
+        } else {
+            return null;
         }
     }
 
@@ -398,7 +424,7 @@ test "add with chainining" {
     try std.testing.expectEqual(1, try trie.query("heroic", &allocator));
 }
 
-test "remove" {
+test "removeRecursive" {
     var allocator = std.heap.page_allocator;
     const trie = try init(&allocator);
     defer allocator.destroy(trie);
@@ -410,12 +436,54 @@ test "remove" {
 
     try std.testing.expectEqual(4, try trie.query("he", &allocator));
 
-    trie.remove("heaven");
+    _ = trie.removeRecursive("heaven");
     try std.testing.expectEqual(3, try trie.query("he", &allocator));
 
-    trie.remove("hell");
+    _ = trie.removeRecursive("hell");
     try std.testing.expectEqual(1, try trie.query("he", &allocator));
 
-    trie.remove("he");
+    _ = trie.removeRecursive("he");
     try std.testing.expectEqual(0, try trie.query("he", &allocator));
+}
+
+test "removeRecursive with missing, short and empty words" {
+    var allocator = std.heap.page_allocator;
+    const trie = try init(&allocator);
+    defer allocator.destroy(trie);
+
+    _ = try trie.add("hello", &allocator, &allocator);
+    _ = try trie.add("heaven", &allocator, &allocator);
+
+    try std.testing.expectEqual(null, trie.removeRecursive("zzz"));
+    try std.testing.expectEqual(null, trie.removeRecursive("hex"));
+    try std.testing.expectEqual(null, trie.removeRecursive("hel"));
+    try std.testing.expectEqual(null, trie.removeRecursive(""));
+    // "he" is only the shared start of the two words, it must not take them along
+    try std.testing.expectEqual(null, trie.removeRecursive("he"));
+    try std.testing.expectEqual(2, try trie.query("he", &allocator));
+}
+
+test "removeSingle" {
+    var allocator = std.heap.page_allocator;
+    const trie = try init(&allocator);
+    defer allocator.destroy(trie);
+
+    _ = try trie.add("he", &allocator, &allocator);
+    _ = try trie.add("hell", &allocator, &allocator);
+    _ = try trie.add("hello", &allocator, &allocator);
+    _ = try trie.add("heaven", &allocator, &allocator);
+
+    try std.testing.expectEqual(4, try trie.query("he", &allocator));
+
+    // A word that is a prefix of other words: only it is removed, its descendants stay
+    try std.testing.expect(trie.removeSingle("hell") != null);
+    try std.testing.expectEqual(3, try trie.query("he", &allocator));
+    try std.testing.expectEqual(1, try trie.query("hell", &allocator));
+
+    // Already removed, never added, ending in the middle of an edge, and empty
+    try std.testing.expectEqual(null, trie.removeSingle("hell"));
+    try std.testing.expectEqual(null, trie.removeSingle("hex"));
+    try std.testing.expectEqual(null, trie.removeSingle("hel"));
+    try std.testing.expectEqual(null, trie.removeSingle(""));
+    try std.testing.expectEqual(3, try trie.query("he", &allocator));
 }
