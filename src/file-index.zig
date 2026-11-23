@@ -4,7 +4,8 @@ const trie = @import("trie.zig");
 pub const Position = *trie.Trie;
 
 pub const FileIndex = struct {
-    mut: std.Thread.Mutex,
+    io: std.Io,
+    mut: std.Io.Mutex,
     trie: *trie.Trie,
     allocator: *std.mem.Allocator,
     stringAllocator: *std.mem.Allocator,
@@ -14,32 +15,33 @@ pub const FileIndex = struct {
     }
 
     pub fn addFileName(self: *FileIndex, position: *trie.Trie, name: []const u8) !*trie.Trie {
-        self.mut.lock();
-        defer self.mut.unlock();
+        self.mut.lockUncancelable(self.io);
+        defer self.mut.unlock(self.io);
 
         return position.add(name, self.allocator, self.stringAllocator);
     }
 
     pub fn query(self: *FileIndex, name: []const u8) !usize {
-        self.mut.lock();
-        defer self.mut.unlock();
+        self.mut.lockUncancelable(self.io);
+        defer self.mut.unlock(self.io);
 
         return self.trie.query(name, self.allocator);
     }
 
     pub fn removeFileName(self: *FileIndex, name: []const u8) !void {
-        self.mut.lock();
-        defer self.mut.unlock();
+        self.mut.lockUncancelable(self.io);
+        defer self.mut.unlock(self.io);
 
         try self.trie.remove(name, self.allocator);
     }
 };
 
-pub fn init(allocator: *std.mem.Allocator, stringAllocator: *std.mem.Allocator) !*FileIndex {
+pub fn init(allocator: *std.mem.Allocator, stringAllocator: *std.mem.Allocator, io: std.Io) !*FileIndex {
     const t = try allocator.create(FileIndex);
     t.* = FileIndex{
         .trie = try trie.init(allocator),
-        .mut = std.Thread.Mutex{},
+        .io = io,
+        .mut = .init,
         .allocator = allocator,
         .stringAllocator = stringAllocator,
     };

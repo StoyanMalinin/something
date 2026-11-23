@@ -4,21 +4,21 @@ const trie = @import("trie.zig");
 
 var index: *fileIndex.FileIndex = undefined;
 
-fn walkSingleThreaded(dir: *std.fs.Dir, position: fileIndex.Position, depth: usize) !i32 {
+fn walkSingleThreaded(dir: *std.Io.Dir, position: fileIndex.Position, depth: usize) !i32 {
     var cnt: i32 = 0;
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         const subPosition = try index.addFileName(position, entry.name);
 
-        if (entry.kind == std.fs.File.Kind.directory) {
-            var subDir: ?std.fs.Dir = dir.openDir(entry.name, .{ .iterate = true, .no_follow = false }) catch |err|
+        if (entry.kind == std.Io.File.Kind.directory) {
+            var subDir: ?std.Io.Dir = dir.openDir(io, entry.name, .{ .iterate = true }) catch |err|
                 switch (err) {
                     error.AccessDenied => null,
                     else => |leftoverErr| return leftoverErr,
                 };
 
             if (subDir != null) {
-                defer subDir.?.close();
+                defer subDir.?.close(io);
                 cnt += try walkSingleThreaded(&subDir.?, subPosition, depth + 1);
             }
         } else {
@@ -30,8 +30,8 @@ fn walkSingleThreaded(dir: *std.fs.Dir, position: fileIndex.Position, depth: usi
 }
 
 const MyDir = struct {
-    dir: *?std.fs.Dir,
-    stat: std.fs.Dir.Stat,
+    dir: *?std.Io.Dir,
+    stat: std.Io.Dir.Stat,
     depth: usize,
     position: fileIndex.Position,
 };
@@ -46,71 +46,63 @@ fn compareDir(_: void, a: MyDir, b: MyDir) std.math.Order {
     return std.math.Order.eq;
 }
 
-fn walkWrapper(dir: *?std.fs.Dir, position: fileIndex.Position, depth: usize, wg: *std.Thread.WaitGroup, mut: *std.Thread.Mutex, cnt: *i32) void {
-    defer wg.*.finish();
+fn walkWrapper(dir: *?std.Io.Dir, position: fileIndex.Position, depth: usize, mut: *std.Io.Mutex, cnt: *i32) void {
     defer gpa.destroy(dir);
-    defer dir.*.?.close();
+    defer dir.*.?.close(io);
 
     const currCnt = walkSingleThreaded(&dir.*.?, position, depth) catch |walkErr| blk: {
         std.debug.print("Error: {any}\n", .{walkErr});
         break :blk 0;
     };
 
-    mut.*.lock();
+    mut.*.lockUncancelable(io);
     cnt.* += currCnt;
-    mut.*.unlock();
+    mut.*.unlock(io);
 }
 
 fn walk(path: []const u8) !i32 {
-    var threadPool: std.Thread.Pool = undefined;
-    try threadPool.init(std.Thread.Pool.Options{
-        .n_jobs = 10,
-        .allocator = gpa,
-    });
-    defer threadPool.deinit();
-
     var pq = std.PriorityQueue(
         MyDir,
         void,
         compareDir,
-    ).init(gpa, void{});
-    defer pq.deinit();
+    ).initContext({});
+    defer pq.deinit(gpa);
 
-    const dir = try gpa.create(?std.fs.Dir);
-    dir.* = try std.fs.cwd().openDir(path, .{ .iterate = true, .no_follow = false });
+    const dir = try gpa.create(?std.Io.Dir);
+    dir.* = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
 
     const pathPosition = try index.addFileName(index.rootPosition(), path);
-    try pq.add(MyDir{ .dir = dir, .stat = try dir.*.?.stat(), .depth = 0, .position = pathPosition });
+    try pq.push(gpa, MyDir{ .dir = dir, .stat = try dir.*.?.stat(io), .depth = 0, .position = pathPosition });
 
     var cnt: i32 = 0;
-    var mutex = std.Thread.Mutex{};
+    var mutex: std.Io.Mutex = .init;
 
     var explored: usize = 0;
     while (explored + pq.count() < 1000 and pq.count() > 0) {
         explored += 1;
 
-        const item: MyDir = pq.remove();
+        const item: MyDir = pq.pop().?;
         defer gpa.destroy(item.dir);
-        defer item.dir.*.?.close();
+        defer item.dir.*.?.close(io);
 
         const position = item.position;
 
         var it = item.dir.*.?.iterate();
-        while (try it.next()) |entry| {
+        while (try it.next(io)) |entry| {
             const subPosition = try index.addFileName(position, entry.name);
 
-            if (entry.kind == std.fs.File.Kind.directory) {
-                const subDir = try gpa.create(?std.fs.Dir);
-                subDir.* = item.dir.*.?.openDir(entry.name, .{ .iterate = true, .no_follow = false }) catch |err|
+            if (entry.kind == std.Io.File.Kind.directory) {
+                const subDir = try gpa.create(?std.Io.Dir);
+                subDir.* = item.dir.*.?.openDir(io, entry.name, .{ .iterate = true }) catch |err|
                     switch (err) {
                         error.AccessDenied => null,
                         else => |leftoverErr| return leftoverErr,
                     };
 
                 if (subDir.* != null) {
-                    try pq.add(MyDir{
+                    try pq.push(gpa, MyDir{
                         .dir = subDir,
-                        .stat = try subDir.*.?.stat(),
+                        .stat = try subDir.*.?.stat(io),
                         .depth = item.depth + 1,
                         .position = subPosition,
                     });
@@ -121,31 +113,28 @@ fn walk(path: []const u8) !i32 {
         }
     }
 
-    var wg: std.Thread.WaitGroup = std.Thread.WaitGroup{};
-    wg.reset();
+    var group: std.Io.Group = .init;
 
     while (pq.count() > 0) {
-        const item = pq.remove();
+        const item = pq.pop().?;
 
-        wg.start();
-        try threadPool.spawn(walkWrapper, .{
+        group.async(io, walkWrapper, .{
             item.dir,
             item.position,
             item.depth + 1,
-            &wg,
             &mutex,
             &cnt,
         });
     }
 
-    wg.wait();
+    try group.await(io);
 
     return cnt;
 }
 
-var _gpa = std.heap.GeneralPurposeAllocator(.{}){};
-var gpa = _gpa.allocator();
-const WalkErrorType = std.fs.Dir.OpenError || std.Thread.SpawnError || std.mem.Allocator.Error;
+var gpa: std.mem.Allocator = undefined;
+var io: std.Io = undefined;
+const WalkErrorType = std.Io.Dir.OpenError || std.Thread.SpawnError || std.mem.Allocator.Error;
 
 const Actions = enum(u32) {
     Add = 1,
@@ -224,8 +213,8 @@ fn setupWatcher(path: []const u8) !void {
         var offset: usize = 0;
 
         var eIndex: usize = 0;
-        var events = [_]*windows.FILE_NOTIFY_INFORMATION{undefined} ** 100;
-        var fileNames = [_][]const u8{undefined} ** 100;
+        var events: [100]*windows.FILE_NOTIFY_INFORMATION = @splat(undefined);
+        var fileNames: [100][]const u8 = @splat(undefined);
 
         while (offset < bytesReturned) {
             offset = ((offset + 3) / 4) * 4; // Align to 4 bytes
@@ -302,24 +291,27 @@ fn setupWatcher(path: []const u8) !void {
     }
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    gpa = init.gpa;
+    io = init.io;
+
     var _stringAllocator = std.heap.FixedBufferAllocator.init(
         try std.heap.page_allocator.alloc(u8, 30 * 1024 * 1024), // 30 MB
     );
     var stringAllocator = _stringAllocator.allocator();
 
     const path = "C:/";
-    index = try fileIndex.init(&gpa, &stringAllocator);
+    index = try fileIndex.init(&gpa, &stringAllocator, io);
 
     const cnt = try walk(path);
     std.debug.print("Total files: {d}\n", .{cnt});
 
     // _ = try std.Thread.spawn(.{}, setupWatcher, .{path});
 
-    const startTime = std.time.milliTimestamp();
+    const startTime = std.Io.Clock.awake.now(io);
     const queryCnt = try index.query("boxes.cpp");
-    const endTime = std.time.milliTimestamp();
-    std.debug.print("Matching files are {d} in {d}ms\n", .{ queryCnt, endTime - startTime });
+    const endTime = std.Io.Clock.awake.now(io);
+    std.debug.print("Matching files are {d} in {d}ms\n", .{ queryCnt, startTime.durationTo(endTime).toMilliseconds() });
 
     const passsthroughCnt = index.rootPosition().scanPassthoughNodes();
     const allCnt = index.rootPosition().scanAllNodes();
@@ -333,6 +325,6 @@ pub fn main() !void {
     std.debug.print("Total direct data used for nodes {d}\n", .{index.rootPosition().scanSize()});
 
     while (true) {
-        std.Thread.sleep(1_000_000_000);
+        try std.Io.sleep(io, .fromSeconds(1), .awake);
     }
 }
