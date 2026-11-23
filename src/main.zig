@@ -134,12 +134,85 @@ var gpa: std.mem.Allocator = undefined;
 var io: std.Io = undefined;
 const WalkErrorType = std.Io.Dir.OpenError || std.Thread.SpawnError || std.mem.Allocator.Error;
 
+fn scanFolder(path: []const u8, position: fileIndex.Position) !void {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        // Gone again, replaced by a file, or not ours to read
+        error.FileNotFound, error.NotDir, error.AccessDenied => return,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    _ = try walkSingleThreaded(&dir, position);
+}
+
+fn addToIndex(path: []const u8, kind: watcher.Kind) !void {
+    const position = try index.addFileName(index.rootPosition(), path, kind == .folder);
+
+    // Generally not necessary: new files are reported one by one, and the add is idempotent.
+    // It only matters for a folder that arrives already full (moved in from outside the
+    // watched tree, or one half of a rename that was split across batches), whose contents
+    // are not reported.
+    if (kind == .folder) {
+        try scanFolder(path, position);
+    }
+}
+
+fn removeFromIndex(path: []const u8, kind: watcher.Kind) !void {
+    _ = try index.removeFileName(index.rootPosition(), path, kind == .folder);
+}
+
+fn moveInIndex(from: []const u8, to: []const u8, kind: watcher.Kind) !void {
+    const root = index.rootPosition();
+    const moved = switch (kind) {
+        .file => try index.moveOrdinaryFile(root, from, root, to),
+        .folder => try index.moveFolder(root, from, root, to),
+    };
+
+    // The source was never indexed, so the destination is new to us
+    if (!moved) {
+        try addToIndex(to, kind);
+    }
+}
+
+fn reportIndexError(what: []const u8, path: []const u8, err: anyerror) void {
+    std.debug.print("index: {s} {s} failed: {any}\n", .{ what, path, err });
+}
+
 fn onFsEvent(_: ?*anyopaque, event: watcher.Event) void {
-    // TODO: apply the change to the index
     switch (event) {
-        .add => |e| std.debug.print("fs event: add {s} ({s})\n", .{ e.path, @tagName(e.kind) }),
-        .remove => |e| std.debug.print("fs event: remove {s} ({s})\n", .{ e.path, @tagName(e.kind) }),
-        .move => |e| std.debug.print("fs event: move {s} -> {s} ({s})\n", .{ e.from, e.to, @tagName(e.kind) }),
+        .add => |e| {
+            std.debug.print("fs event: add {s} ({s})\n", .{ e.path, @tagName(e.kind) });
+            addToIndex(e.path, e.kind) catch |err| reportIndexError("add", e.path, err);
+        },
+        .remove => |e| {
+            std.debug.print("fs event: remove {s} ({s})\n", .{ e.path, @tagName(e.kind) });
+            removeFromIndex(e.path, e.kind) catch |err| reportIndexError("remove", e.path, err);
+        },
+        .move => |e| {
+            std.debug.print("fs event: move {s} -> {s} ({s})\n", .{ e.from, e.to, @tagName(e.kind) });
+            moveInIndex(e.from, e.to, e.kind) catch |err| reportIndexError("move", e.to, err);
+        },
+    }
+}
+
+// The watcher delivers its events on its own dispatch queue, so this thread is free to answer
+// queries while the index changes underneath it.
+fn queryLoop() !void {
+    var buf: [4096]u8 = undefined;
+    var stdin = std.Io.File.stdin().reader(io, &buf);
+
+    while (true) {
+        std.debug.print("query (:q or ctrl-d to quit)> ", .{});
+
+        const line = (try stdin.interface.takeDelimiter('\n')) orelse return;
+        const word = std.mem.trim(u8, line, " \t\r");
+        if (word.len == 0) continue;
+        if (std.mem.eql(u8, word, ":q")) return;
+
+        const startTime = std.Io.Clock.awake.now(io);
+        const cnt = try index.query(word);
+        const endTime = std.Io.Clock.awake.now(io);
+        std.debug.print("{d} matches in {d}ms\n", .{ cnt, startTime.durationTo(endTime).toMilliseconds() });
     }
 }
 
@@ -153,8 +226,8 @@ pub fn main(init: std.process.Init) !void {
     var stringAllocator = _stringAllocator.allocator();
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const path = if (args.len > 1) args[1] else "/";
-    const needle = if (args.len > 2) args[2] else "boxes.cpp";
+    // FSEvents reports absolute, resolved paths, so the index has to be built from the same
+    const path = try std.Io.Dir.cwd().realPathFileAlloc(io, if (args.len > 1) args[1] else "/", init.arena.allocator());
     index = try fileIndex.init(&gpa, &stringAllocator, io);
 
     const cnt = try walk(path);
@@ -162,11 +235,6 @@ pub fn main(init: std.process.Init) !void {
 
     const fsWatcher = try watcher.Watcher.start(gpa, path, 0.1, onFsEvent, null);
     defer fsWatcher.stop(gpa);
-
-    const startTime = std.Io.Clock.awake.now(io);
-    const queryCnt = try index.query(needle);
-    const endTime = std.Io.Clock.awake.now(io);
-    std.debug.print("Matching files are {d} in {d}ms\n", .{ queryCnt, startTime.durationTo(endTime).toMilliseconds() });
 
     const passsthroughCnt = index.rootPosition().scanPassthoughNodes();
     const allCnt = index.rootPosition().scanAllNodes();
@@ -179,7 +247,5 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Total chars used are {d}\n", .{index.rootPosition().scanTotalCharCount()});
     std.debug.print("Total direct data used for nodes {d}\n", .{index.rootPosition().scanSize()});
 
-    while (true) {
-        try std.Io.sleep(io, .fromSeconds(1), .awake);
-    }
+    try queryLoop();
 }
