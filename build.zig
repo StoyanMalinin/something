@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+    const keep_frame_pointers = b.option(bool, "frame-pointers", "Keep frame pointers (accurate profiler stacks)") orelse false;
 
     // We will also create a module for our other entry point, 'main.zig'.
     const exe_mod = b.createModule(.{
@@ -24,6 +25,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        // Profilers (samply) unwind by following frame pointers; optimized builds omit
+        // them by default, which produces bogus call stacks. See scripts/profile.sh.
+        .omit_frame_pointer = if (keep_frame_pointers) false else null,
     });
 
     // FSEvents (macOS file system change notifications) comes from CoreServices.
