@@ -7,7 +7,7 @@
 //! scored once per query instead of once per path.
 //!
 //! Scoring is a simplified Smith-Waterman (the same family as fzf/frizbee):
-//!   - query bytes must appear in order in the candidate
+//!   - query bytes are matched in order in the candidate
 //!   - bonuses for matching at word starts (after `/`, `_`, `-`, `.`, space,
 //!     camelCase humps, letter->digit) and for consecutive matches
 //!   - affine gap penalties between matched bytes
@@ -19,10 +19,9 @@
 //!
 //! Typos are part of the model: a query byte may be matched against a
 //! different byte, or be dropped altogether, each at a penalty, in the same
-//! DP: no extra state, just more transitions.
-//! A query gets one typo per `Config.chars_per_typo` bytes, so short queries
-//! stay strict. A candidate matches if its best alignment scores above a floor
-//! derived from that, so the number of typos is only bounded through the score.
+//! DP: no extra state, just more transitions. There is no limit on them and
+//! no cutoff: every non-empty candidate gets a score, and typos only push it
+//! down the ranking.
 //!
 //! Case handling is "smart case": an all-lowercase query matches
 //! case-insensitively, a query with any uppercase letter matches exactly.
@@ -35,8 +34,6 @@ pub const max_query_len = 64;
 const Score = i16;
 /// "No alignment". Kept well above minInt so subtracting penalties can't overflow.
 const NEG: Score = std.math.minInt(Score) / 2;
-/// The same, for the i32 accumulator of the trailing-drop maximum.
-const no_alignment: i32 = std.math.minInt(i32) / 2;
 
 pub const Config = struct {
     score_match: Score = 16,
@@ -59,9 +56,6 @@ pub const Config = struct {
     /// Upper bound on that penalty, so it only reorders close matches.
     max_trailing_penalty: i32 = 16,
 
-    /// One typo is allowed per this many query bytes, so short queries stay
-    /// strict. 0 turns typos off: every query byte must then match, in order.
-    chars_per_typo: u8 = 3,
     /// Charged when a query byte is matched against a different candidate byte,
     /// on top of the match reward it gives up.
     typo_penalty: Score = 24,
@@ -75,58 +69,70 @@ pub const Config = struct {
 /// penalty up to now. `done`: best complete alignment seen so far;
 /// `done_end`: how many candidate bytes had been fed when it ended (the latest
 /// such point, on ties).
-const Rows = struct {
-    m: [max_query_len]Score = @splat(NEG),
-    g: [max_query_len]Score = @splat(NEG),
-    done: Score = NEG,
-    done_end: u32 = 0,
-};
+///
+/// `L` is the number of query positions it has room for (a multiple of the
+/// vector width, at least the query's length), so short queries carry small
+/// states.
+fn RowsOf(comptime L: usize) type {
+    return struct {
+        pub const lanes = L;
+
+        m: [L]Score = @splat(NEG),
+        g: [L]Score = @splat(NEG),
+        done: Score = NEG,
+        done_end: u32 = 0,
+    };
+}
+
+/// The lane count to use for a query of this length: the smallest of 8, 16,
+/// 32 and `max_query_len` that fits it. Callers switch on this to turn the
+/// runtime length into the comptime `L` of `StateOf`.
+pub fn lanesFor(query_len: usize) usize {
+    return switch (query_len) {
+        0...8 => 8,
+        9...16 => 16,
+        17...32 => 32,
+        else => max_query_len,
+    };
+}
 
 /// Matching progress over the candidate bytes fed so far. Plain value:
 /// copy it to snapshot, assign the copy back to restore.
-pub const State = struct {
-    /// Over the whole candidate.
-    full: Rows = .{},
-    /// Over the current path segment only.
-    seg: Rows = .{},
-    prev: u8 = '/',
-    /// Candidate bytes fed so far.
-    len: u32 = 0,
-    /// A `/` was seen; the segment rows are reset lazily on the next byte so
-    /// that a trailing `/` keeps the previous segment as the filename.
-    seg_reset_pending: bool = false,
-};
+pub fn StateOf(comptime L: usize) type {
+    return struct {
+        pub const lanes = L;
+
+        /// Over the whole candidate.
+        full: RowsOf(L) = .{},
+        /// Over the current path segment only.
+        seg: RowsOf(L) = .{},
+        prev: u8 = '/',
+        /// Candidate bytes fed so far.
+        len: u32 = 0,
+        /// A `/` was seen; the segment rows are reset lazily on the next byte so
+        /// that a trailing `/` keeps the previous segment as the filename.
+        seg_reset_pending: bool = false,
+    };
+}
+
+/// A state with room for any query.
+pub const State = StateOf(max_query_len);
 
 pub const Matcher = struct {
     query: [max_query_len]u8,
     len: usize,
     case_sensitive: bool,
     config: Config,
-    /// How many typos this query may have. 0 means strict matching.
-    typos: usize,
-    /// With typos allowed (`typos > 0`), a candidate matches only if its best alignment
-    /// scores at least this much (before the filename bonus and trailing
-    /// penalty): the match reward of the query bytes that are not allowed to
-    /// be typos. Nothing counts the typos an alignment really used, so this is
-    /// an approximation in both directions. One that has more typos than
-    /// allowed gets through when its bonuses make up for them (`mxyn` finds
-    /// `main`), and a legitimate one with weak bonuses can miss (`mian` against
-    /// `xmain`, where the match starts mid-word). Measured on a handful of
-    /// queries, it still rejects every query with nothing in common.
-    min_done: i32,
 
     pub fn init(query: []const u8, config: Config) error{QueryTooLong}!Matcher {
         if (query.len > max_query_len) return error.QueryTooLong;
 
-        const typos = if (config.chars_per_typo == 0) 0 else query.len / config.chars_per_typo;
-
         var self: Matcher = .{
-            .query = undefined,
+            // Zeros past the end: the vector step compares whole registers
+            .query = @splat(0),
             .len = query.len,
             .case_sensitive = false,
             .config = config,
-            .typos = typos,
-            .min_done = @as(i32, @intCast(query.len - typos)) * config.score_match,
         };
         for (query) |c| {
             if (std.ascii.isUpper(c)) {
@@ -140,15 +146,18 @@ pub const Matcher = struct {
         return self;
     }
 
+    /// A fresh state with room for any query. Use `StateOf(lanesFor(len))` for
+    /// a smaller one.
     pub fn start(_: *const Matcher) State {
         return .{};
     }
 
-    pub fn feed(self: *const Matcher, state: *State, chunk: []const u8) void {
+    /// `state` is a pointer to a `StateOf(L)` with `L >= self.len`.
+    pub fn feed(self: *const Matcher, state: anytype, chunk: []const u8) void {
         for (chunk) |c| self.feedByte(state, c);
     }
 
-    pub fn feedByte(self: *const Matcher, state: *State, c: u8) void {
+    pub fn feedByte(self: *const Matcher, state: anytype, c: u8) void {
         defer state.prev = c;
         state.len +|= 1;
 
@@ -169,14 +178,11 @@ pub const Matcher = struct {
         self.step(&state.seg, c, b, state.len);
     }
 
-    /// Score for the candidate fed so far, or null if it doesn't match.
-    /// Higher is better. Does not modify the state, so you can keep feeding.
-    pub fn finish(self: *const Matcher, state: *const State) ?i32 {
+    /// Score for the candidate fed so far, or null if nothing has been fed
+    /// yet. Higher is better. Does not modify the state, so you can keep feeding.
+    pub fn finish(self: *const Matcher, state: anytype) ?i32 {
         if (self.len == 0) return 0;
         if (state.full.done <= NEG) return null;
-        // The segment rows hold a subset of the alignments the full rows do,
-        // so this also rules the filename score out.
-        if (self.typos > 0 and state.full.done < self.min_done) return null;
 
         var s: i32 = state.full.done - self.trailingPenalty(state, &state.full);
         if (state.seg.done > NEG) {
@@ -187,7 +193,7 @@ pub const Matcher = struct {
         return s;
     }
 
-    fn trailingPenalty(self: *const Matcher, state: *const State, rows: *const Rows) i32 {
+    fn trailingPenalty(self: *const Matcher, state: anytype, rows: anytype) i32 {
         const cfg = &self.config;
         if (cfg.trailing_divisor == 0) return 0;
         const trailing = (state.len - rows.done_end) / cfg.trailing_divisor;
@@ -196,97 +202,122 @@ pub const Matcher = struct {
 
     /// One-shot convenience: score a whole candidate.
     pub fn score(self: *const Matcher, candidate: []const u8) ?i32 {
-        var state = self.start();
+        return switch (lanesFor(self.len)) {
+            8 => self.scoreL(8, candidate),
+            16 => self.scoreL(16, candidate),
+            32 => self.scoreL(32, candidate),
+            else => self.scoreL(max_query_len, candidate),
+        };
+    }
+
+    fn scoreL(self: *const Matcher, comptime L: usize, candidate: []const u8) ?i32 {
+        var state: StateOf(L) = .{};
         self.feed(&state, candidate);
         return self.finish(&state);
+    }
+
+    /// Upper bound on the `full.done` reachable by feeding more bytes, all
+    /// with byte classes in `mask` (see `byteBit`). It also bounds the segment
+    /// rows, whose alignments are a subset. Assumes every remaining query byte
+    /// gets the best case: an exact match with the largest bonus if its class
+    /// is in the mask, otherwise a typo with the largest bonus. Starting over
+    /// at any query byte, dropping the ones before it, is covered too.
+    pub fn subtreeBound(self: *const Matcher, state: anytype, mask: u64) i32 {
+        const n = self.len;
+        if (n == 0) return 0;
+        const cfg = &self.config;
+        const max_b: i32 = @max(@max(cfg.bonus_path_boundary, cfg.bonus_boundary), @max(cfg.bonus_camel, cfg.bonus_consecutive));
+        const exact: i32 = cfg.score_match;
+        // Dropping a query byte instead is never better with sane penalties,
+        // but costs nothing to account for.
+        const typo: i32 = @max(exact - cfg.typo_penalty, -@as(i32, cfg.skip_penalty) - max_b);
+
+        var best: i32 = state.full.done;
+        var suffix: i32 = 0; // best case for the query bytes after j
+        var j: usize = n;
+        while (j > 0) {
+            j -= 1;
+            const match: i32 = if (mask & byteBit(self.query[j]) != 0) exact else typo;
+            const live = @max(state.full.m[j], state.full.g[j]);
+            if (live > NEG) best = @max(best, live + suffix);
+            const first = match + max_b * cfg.first_char_multiplier - @as(i32, @intCast(j)) * cfg.skip_penalty;
+            best = @max(best, first + suffix);
+            suffix += match + max_b;
+        }
+        return best;
+    }
+
+    /// Whether a subtree with this bound can still produce a result that gets
+    /// into a TopK whose `threshold()` is `threshold`. The trailing penalty is
+    /// left out, so this errs on the side of keeping.
+    pub fn canReach(self: *const Matcher, bound: i32, threshold: ?i32) bool {
+        const t = threshold orelse return true;
+        return bound + self.config.filename_bonus >= t;
     }
 
     fn fold(self: *const Matcher, c: u8) u8 {
         return if (self.case_sensitive) c else std.ascii.toLower(c);
     }
 
-    fn step(self: *const Matcher, rows: *Rows, c: u8, b: Score, fed: u32) void {
+    fn step(self: *const Matcher, rows: anytype, c: u8, b: Score, fed: u32) void {
+        std.debug.assert(self.len != 0 and self.len <= @TypeOf(rows.*).lanes);
+        self.stepLanes(@TypeOf(rows.*).lanes, rows, c, b, fed);
+    }
+
+    /// Feeds one candidate byte to all query positions at once: lane j holds
+    /// query[j]. Lanes from `len` up hold values that are never read, and
+    /// nothing flows from a higher lane to a lower one.
+    fn stepLanes(self: *const Matcher, comptime L: usize, rows: anytype, c: u8, b: Score, fed: u32) void {
+        const V = @Vector(L, Score);
         const cfg = &self.config;
-        const key = self.fold(c);
         const n = self.len;
-        const tolerant = self.typos > 0;
+        const skip: V = @splat(cfg.skip_penalty);
+        const j_skip = std.simd.iota(Score, L) * skip;
 
-        // Walk j upwards, in place. Writing m[j] and g[j] destroys the values
-        // from the previous byte that index j+1 needs, so they are carried in
-        // `prev_*`, along with the best ways to have arrived at index j-1 by
-        // dropping query bytes (`drop_*`). Dropping consumes no candidate byte,
-        // so it is a running maximum along j, and a chain of any length costs
-        // O(1) per index:
-        //   drop[i] = max(m[i-1], drop[i-1]) - skip_penalty
-        var prev_m: Score = NEG;
-        var prev_g: Score = NEG;
-        var drop_m: Score = NEG;
-        var drop_g: Score = NEG;
-        // For alignments that end by dropping the rest of the query: the best
-        // m[i] + i * skip_penalty over the indexes before the last one.
-        var trailing: i32 = no_alignment;
+        const old_m: V = rows.m[0..L].*;
+        const old_g: V = rows.g[0..L].*;
 
-        var j: usize = 0;
-        while (j < n) : (j += 1) {
-            const old_m = rows.m[j];
-            const old_g = rows.g[j];
+        // A byte that differs from query[j] can still be matched to it as a
+        // typo, at a price.
+        const query: @Vector(L, u8) = self.query[0..L].*;
+        const exact = query == @as(@Vector(L, u8), @splat(self.fold(c)));
+        const match_score = @select(Score, exact, @as(V, @splat(cfg.score_match)), @as(V, @splat(cfg.score_match - cfg.typo_penalty)));
 
-            // A byte that differs from query[j] can still be matched to it as
-            // a typo, at a price.
-            const exact = self.query[j] == key;
-            var new_m: Score = NEG;
-            if (exact or tolerant) {
-                const match_score = cfg.score_match - if (exact) 0 else cfg.typo_penalty;
-                const first = match_score + b * cfg.first_char_multiplier;
+        // The best alignment of query[0..j-1] to come from: one that ended at
+        // query[i], i < j, followed by dropping query[i+1..j-1]:
+        //   max over i < j of old[i] - (j-1-i) * skip_penalty
+        //   = (max over i < j of old[i] + i * skip_penalty) - (j-1) * skip_penalty
+        // Lane 0 has nothing before it (NEG).
+        const adjacent = maxBefore(L, old_m + j_skip) - j_skip + skip;
+        const gapped = maxBefore(L, old_g + j_skip) - j_skip + skip;
 
-                if (j == 0) {
-                    new_m = first;
-                } else {
-                    // Everything before j dropped: j is the first match.
-                    if (tolerant) new_m = first - @as(Score, @intCast(j)) * cfg.skip_penalty;
+        // The best alignment of query[0..=j] ending here is the best of three.
+        // One built on "no alignment" (NEG) can never win: `first` is at least
+        // score_match - typo_penalty - (max_query_len - 1) * skip_penalty,
+        // far above NEG plus any reward.
+        // Everything before j dropped: j is the first match.
+        const first = match_score + @as(V, @splat(b * cfg.first_char_multiplier)) - j_skip;
+        // Right after the previous match.
+        const consecutive = adjacent + match_score + @as(V, @splat(@max(b, cfg.bonus_consecutive)));
+        // After a gap since the previous match.
+        const after_gap = gapped + match_score + @as(V, @splat(b));
+        const new_m = @max(first, @max(consecutive, after_gap));
 
-                    const adjacent = @max(prev_m, drop_m);
-                    const gapped = @max(prev_g, drop_g);
-                    if (adjacent > NEG) {
-                        new_m = @max(new_m, adjacent + match_score + @max(b, cfg.bonus_consecutive));
-                    }
-                    if (gapped > NEG) {
-                        new_m = @max(new_m, gapped + match_score + b);
-                    }
-                }
-            }
+        const extended = old_g - @as(V, @splat(cfg.gap_extend));
+        const opened = old_m - @as(V, @splat(cfg.gap_open));
+        rows.m[0..L].* = new_m;
+        rows.g[0..L].* = @max(@max(extended, opened), @as(V, @splat(NEG)));
 
-            if (tolerant) {
-                drop_m = dropped(@max(prev_m, drop_m), cfg.skip_penalty);
-                drop_g = dropped(@max(prev_g, drop_g), cfg.skip_penalty);
-                if (j + 1 < n and new_m > NEG) {
-                    trailing = @max(trailing, @as(i32, new_m) + @as(i32, @intCast(j)) * cfg.skip_penalty);
-                }
-            }
-
-            const extended = @max(old_g - cfg.gap_extend, NEG);
-            const opened = @max(old_m - cfg.gap_open, NEG);
-            rows.g[j] = @max(extended, opened);
-            rows.m[j] = new_m;
-            prev_m = old_m;
-            prev_g = old_g;
-        }
-
-        var complete = rows.m[n - 1];
-        if (trailing > no_alignment) {
-            const ended = trailing - @as(i32, @intCast(n - 1)) * cfg.skip_penalty;
-            if (ended > NEG) complete = @max(complete, @as(Score, @intCast(ended)));
-        }
-        if (complete > NEG and complete >= rows.done) {
+        // A complete alignment ends here by matching the last query byte, or
+        // by matching an earlier one and dropping the rest
+        const before_last = std.simd.iota(u8, L) < @as(@Vector(L, u8), @splat(@intCast(n - 1)));
+        const dropping = @select(Score, before_last, new_m + j_skip, @as(V, @splat(NEG)));
+        const ended = @reduce(.Max, dropping) - @as(Score, @intCast(n - 1)) * cfg.skip_penalty;
+        const complete = @max(rows.m[n - 1], ended);
+        if (complete >= rows.done) {
             rows.done = complete;
             rows.done_end = fed;
         }
-    }
-
-    /// `value` after dropping one more query byte; still "no alignment" if it was.
-    fn dropped(value: Score, skip_penalty: Score) Score {
-        if (value <= NEG) return NEG;
-        return @max(value - skip_penalty, NEG);
     }
 
     fn bonus(self: *const Matcher, prev: u8, c: u8) Score {
@@ -304,6 +335,27 @@ pub const Matcher = struct {
         };
     }
 };
+
+/// Lane j: the maximum of lanes 0..j-1 of `v`, or NEG for lane 0. A prefix
+/// maximum in log2(L) shift-and-max steps.
+fn maxBefore(comptime L: usize, v: @Vector(L, Score)) @Vector(L, Score) {
+    var acc = shiftUp(L, v, 1);
+    comptime var k = 1;
+    inline while (k < L) : (k *= 2) {
+        acc = @max(acc, shiftUp(L, acc, k));
+    }
+    return acc;
+}
+
+/// `v` moved `k` lanes up, with NEG shifted into the bottom lanes.
+fn shiftUp(comptime L: usize, v: @Vector(L, Score), comptime k: usize) @Vector(L, Score) {
+    const mask = comptime blk: {
+        var m: @Vector(L, i32) = undefined;
+        for (0..L) |i| m[i] = if (i < k) -1 else @intCast(i - k);
+        break :blk m;
+    };
+    return @shuffle(Score, v, @as(@Vector(L, Score), @splat(NEG)), mask);
+}
 
 /// Keeps the `buf.len` best items, best first: higher score wins, then lower
 /// `tiebreak` (e.g. path length), then whichever was pushed first. No
@@ -387,11 +439,10 @@ fn expectBetter(query: []const u8, better: []const u8, worse: []const u8) !void 
     }
 }
 
-test "bytes must appear in order, with typos off" {
-    try testing.expect(strictScoreOf("abc", "a_b_c") != null);
-    try testing.expect(strictScoreOf("abc", "acb") == null);
-    try testing.expect(strictScoreOf("abc", "ab") == null);
-    try testing.expect(strictScoreOf("abc", "") == null);
+test "bytes in order beat bytes out of order or missing" {
+    try expectBetter("abc", "a_b_c", "acb");
+    try expectBetter("abc", "a_b_c", "ab");
+    try testing.expect(scoreOf("abc", "") == null);
 }
 
 test "empty query matches everything with score 0" {
@@ -399,10 +450,11 @@ test "empty query matches everything with score 0" {
     try testing.expectEqual(@as(?i32, 0), scoreOf("", ""));
 }
 
-test "smart case, with typos off" {
-    try testing.expect(strictScoreOf("foo", "src/FOO.zig") != null);
-    try testing.expect(strictScoreOf("Foo", "src/Foo.zig") != null);
-    try testing.expect(strictScoreOf("Foo", "src/foo.zig") == null);
+test "smart case" {
+    // All lowercase: case-insensitive
+    try testing.expectEqual(scoreOf("foo", "src/foo.zig"), scoreOf("foo", "src/FOO.zig"));
+    // Any uppercase: other cases only match as typos
+    try expectBetter("Foo", "src/Foo.zig", "src/foo.zig");
 }
 
 test "query longer than the limit is rejected" {
@@ -538,60 +590,33 @@ test "ranking a small list end to end" {
         if (m.score(p)) |s| _ = top.push(s, @intCast(p.len), i);
     }
 
-    try testing.expectEqual(@as(usize, 1), top.items().len);
+    // Every path gets a score, so the TopK fills up; the real match leads
+    try testing.expectEqual(@as(usize, 3), top.items().len);
     try testing.expectEqualStrings("src/file-index.zig", paths[top.items()[0].item]);
 }
 
 // ------------------------------------------------------- typo tolerance
 
-const strict: Config = .{ .chars_per_typo = 0 };
-
-fn strictScoreOf(query: []const u8, candidate: []const u8) ?i32 {
-    const m = Matcher.init(query, strict) catch unreachable;
-    return m.score(candidate);
-}
-
-test "typos can be turned off" {
-    const m = try Matcher.init("mxin", strict);
-    try testing.expectEqual(@as(usize, 0), m.typos);
-    try testing.expect(m.score("src/main.zig") == null);
-    try testing.expect(scoreOf("mxin", "src/main.zig") != null);
-}
-
 test "typos: a wrong query byte is tolerated" {
-    try testing.expect(scoreOf("mxin", "src/main.zig") != null);
+    try expectBetter("mxin", "src/main.zig", "src/zzzz.zig");
 }
 
 test "typos: a query byte with no counterpart is dropped" {
-    try testing.expect(scoreOf("maxin", "src/main.zig") != null);
+    try expectBetter("maxin", "src/main.zig", "src/zzzz.zig");
     // Leading and trailing extras
-    try testing.expect(scoreOf("xmain", "src/main.zig") != null);
-    try testing.expect(scoreOf("mainx", "src/main.zig") != null);
+    try expectBetter("xmain", "src/main.zig", "src/zzzz.zig");
+    try expectBetter("mainx", "src/main.zig", "src/zzzz.zig");
 }
 
 test "typos: a swapped pair is one dropped byte" {
-    try testing.expect(strictScoreOf("mian", "src/main.zig") == null);
-    try testing.expect(scoreOf("mian", "src/main.zig") != null);
-}
-
-test "typos: short queries stay strict" {
-    try testing.expectEqual(@as(usize, 0), (try Matcher.init("mx", .{})).typos);
-    try testing.expect(scoreOf("mx", "src/main.zig") == null);
-    try testing.expectEqual(@as(usize, 1), (try Matcher.init("mxi", .{})).typos);
-    try testing.expectEqual(@as(usize, 2), (try Matcher.init("mxinxx", .{})).typos);
-}
-
-test "typos: a query with nothing in common is rejected" {
-    try testing.expect(scoreOf("qzx", "src/main.zig") == null);
-    try testing.expect(scoreOf("qqqqqq", "src/main.zig") == null);
-    try testing.expect(scoreOf("zzzz", "src/main.zig") == null);
-    try testing.expect(scoreOf("wxyzab", "src/watcher.zig") == null);
+    try expectBetter("mian", "src/main.zig", "src/zzzz.zig");
 }
 
 test "typos: exact matches outrank typo matches" {
-    const exact = scoreOf("main", "src/main.zig").?;
-    const typo = scoreOf("mxin", "src/main.zig").?;
-    try testing.expect(exact > typo);
+    try expectBetter("main", "src/main.zig", "src/mxin.zig");
+    try expectBetter("mxin", "src/mxin.zig", "src/main.zig");
+    // Even short queries: one typo costs more than the best bonus earns
+    try expectBetter("ma", "xmax", "src/mx");
 }
 
 test "typos: chunked feeding gives the same score as one-shot" {
@@ -607,12 +632,72 @@ test "typos: chunked feeding gives the same score as one-shot" {
     }
 }
 
-test "typos: drops are not capped" {
-    // Three query bytes with no counterpart in a row, forgiven by letting every
-    // byte be a typo (a floor of 0)
-    const lenient: Config = .{ .chars_per_typo = 1 };
-    const m = try Matcher.init("mxyzain", lenient);
-    try testing.expect(m.score("src/main.zig") != null);
-    const none = try Matcher.init("mxyzain", strict);
-    try testing.expect(none.score("src/main.zig") == null);
+test "typos: every candidate gets a score, more typos rank lower" {
+    try testing.expect(scoreOf("qzx", "src/main.zig") != null);
+    try expectBetter("mxyzain", "src/main.zig", "src/zzzz.zig");
+    try expectBetter("mxyzain", "src/mxyzain.zig", "src/main.zig");
+}
+
+/// A byte's class, as one bit of a u64: a letter (either case), a digit, one
+/// of `._- /`, or a bucket shared by all other bytes. Fine enough for "can
+/// this byte occur below here", and a shared bucket only errs on the side of yes.
+pub fn byteBit(c: u8) u64 {
+    const l = std.ascii.toLower(c);
+    const idx: u6 = switch (l) {
+        'a'...'z' => @intCast(l - 'a'),
+        '0'...'9' => @intCast(26 + l - '0'),
+        '.' => 36,
+        '_' => 37,
+        '-' => 38,
+        ' ' => 39,
+        '/' => 40,
+        else => @intCast(41 + l % 23),
+    };
+    return @as(u64, 1) << idx;
+}
+
+/// The byte classes in `s`.
+pub fn labelMask(s: []const u8) u64 {
+    var m: u64 = 0;
+    for (s) |c| m |= byteBit(c);
+    return m;
+}
+
+test "subtreeBound never undercuts what feeding the rest can reach" {
+    var prng = std.Random.DefaultPrng.init(42);
+    const rnd = prng.random();
+    const alphabet = "abcmainzigMAx/._-1";
+    const queries = [_][]const u8{ "a", "ma", "main", "mxin", "zig", "abc/x", "Main", "ii", "xyzzyq", "m.z" };
+
+    for (queries) |q| {
+        const m = try Matcher.init(q, .{});
+        for (0..300) |_| {
+            var buf: [24]u8 = undefined;
+            const len = rnd.intRangeAtMost(usize, 1, buf.len);
+            for (buf[0..len]) |*c| c.* = alphabet[rnd.uintLessThan(usize, alphabet.len)];
+            const cand = buf[0..len];
+            const threshold = rnd.intRangeAtMost(i32, 0, 200);
+
+            for (0..len) |split| {
+                var state = m.start();
+                m.feed(&state, cand[0..split]);
+                const bound = m.subtreeBound(&state, labelMask(cand[split..]));
+                const reachable = m.canReach(bound, threshold);
+
+                m.feed(&state, cand[split..]);
+                try testing.expect(bound >= state.full.done);
+                if (!reachable) try testing.expect(m.finish(&state).? < threshold);
+            }
+        }
+    }
+}
+
+test "subtreeBound rules out subtrees missing query bytes, given a threshold" {
+    const m = try Matcher.init("main", .{});
+    var state = m.start();
+    m.feed(&state, "src/ma");
+    const t = m.score("src/main").?;
+    try testing.expect(!m.canReach(m.subtreeBound(&state, labelMask("xyz.zig")), t));
+    try testing.expect(m.canReach(m.subtreeBound(&state, labelMask("in.zig")), t));
+    try testing.expect(m.canReach(m.subtreeBound(&state, labelMask("xyz.zig")), null));
 }

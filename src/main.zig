@@ -95,11 +95,15 @@ fn queryLoop() !void {
     }
 }
 
+var _stringAllocator: std.heap.FixedBufferAllocator = undefined;
+var stringAllocator: std.mem.Allocator = undefined;
+
 pub fn createIndex(path: []const u8) !void {
-    var _stringAllocator = std.heap.FixedBufferAllocator.init(
-        try std.heap.page_allocator.alloc(u8, 40 * 1024 * 1024), // 40 MB
+    // The index keeps pointers to both, so they must outlive this function
+    _stringAllocator = std.heap.FixedBufferAllocator.init(
+        try std.heap.page_allocator.alloc(u8, 50 * 1024 * 1024), // 50 MB
     );
-    var stringAllocator = _stringAllocator.allocator();
+    stringAllocator = _stringAllocator.allocator();
 
     index = try fileIndex.init(&gpa, &stringAllocator, io);
 
@@ -138,4 +142,17 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Total direct data used for nodes {d}\n", .{index.rootPosition().scanSize()});
 
     try queryLoop();
+
+    // The index is deliberately never freed. On return, the leak checker would print a stack
+    // trace (loading DWARF each time) for every allocation, which takes minutes and stalls
+    // profiling and benchmark runs. Debug and ReleaseSafe builds still report leaks.
+    if (@import("builtin").mode == .fast) std.process.exit(0);
+}
+
+test {
+    // Pull in the other files' tests; `zig build test` is rooted here
+    _ = fileIndex;
+    _ = trie;
+    _ = watcher;
+    _ = walk;
 }

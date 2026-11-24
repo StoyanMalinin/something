@@ -11,6 +11,38 @@ const TrieChild = struct {
 pub const Trie = struct {
     children: std.SinglyLinkedList,
     isFinal: bool,
+    parent: ?*Trie = null,
+    /// The byte classes (`fuzzy.byteBit`) of the incoming edge's label and of
+    /// everything below, so a search can bound the best score in a subtree
+    /// (`fuzzy.Matcher.subtreeBound`) and skip it. Always covers the children's
+    /// masks; it may cover more after a removal, which only costs pruning power.
+    sub: u64 = 0,
+
+    /// Adds byte classes to this node's mask and to its ancestors'. Stops at
+    /// the first one that has them all, since its ancestors do too.
+    fn widenMask(self: *Trie, mask: u64) void {
+        var node: ?*Trie = self;
+        while (node) |n| : (node = n.parent) {
+            if (n.sub & mask == mask) return;
+            n.sub |= mask;
+        }
+    }
+
+    /// Takes over `other`'s children (it keeps none), discarding its own.
+    pub fn adoptChildren(self: *Trie, other: *Trie, allocator: *std.mem.Allocator) void {
+        self.destroyChildren(allocator);
+        self.children = other.children;
+        other.children = .{};
+
+        var below: u64 = 0;
+        var node = self.children.first;
+        while (node) |n| : (node = n.next) {
+            const child: *TrieChild = @fieldParentPtr("node", n);
+            child.trie.parent = self;
+            below |= child.trie.sub;
+        }
+        self.widenMask(below);
+    }
 
     pub fn scanPassthoughNodes(self: *Trie) usize {
         var cnt: usize = 0;
@@ -115,7 +147,7 @@ pub const Trie = struct {
         self.children.prepend(&child.node);
     }
 
-    fn splitChild(allocator: *std.mem.Allocator, child: *TrieChild, splitPos: usize) !*Trie {
+    fn splitChild(self: *Trie, allocator: *std.mem.Allocator, child: *TrieChild, splitPos: usize) !*Trie {
         const newChild = try allocator.create(TrieChild);
         newChild.* = TrieChild{
             .path = child.path[splitPos..],
@@ -123,6 +155,11 @@ pub const Trie = struct {
         };
 
         const newNode = try initWithChild(allocator, newChild);
+        newNode.parent = self;
+        // Covers both halves of the label and everything below. The lower node
+        // keeps its mask too, which still covers its (now shorter) label.
+        newNode.sub = child.trie.sub;
+        child.trie.parent = newNode;
 
         child.path = child.path[0..splitPos];
         child.trie = newNode;
@@ -158,6 +195,8 @@ pub const Trie = struct {
                         .trie = newNode,
                     };
                     node.appendChild(newChild);
+                    newNode.parent = node;
+                    newNode.widenMask(fuzzy.labelMask(newChildPath));
 
                     childInProgress = newChild;
                     pathPos = remLen;
@@ -176,7 +215,7 @@ pub const Trie = struct {
                 } else if (childInProgress.?.path[pathPos] == c) {
                     pathPos += 1;
                 } else { // We have a mismatch, so we need to split the node
-                    const commonNode = try splitChild(allocator, childInProgress.?, pathPos);
+                    const commonNode = try node.splitChild(allocator, childInProgress.?, pathPos);
 
                     const remLen = word.len - @as(usize, @intCast(i));
                     const newNode = try init(allocator);
@@ -188,6 +227,8 @@ pub const Trie = struct {
                         .trie = newNode,
                     };
                     commonNode.appendChild(newChild);
+                    newNode.parent = commonNode;
+                    newNode.widenMask(fuzzy.labelMask(newChildPath));
 
                     node = commonNode;
                     childInProgress = newChild;
@@ -207,7 +248,7 @@ pub const Trie = struct {
 
             // We are a proper prefix of an existing child, so we need to split
 
-            const newNode = try splitChild(allocator, child, pathPos);
+            const newNode = try node.splitChild(allocator, child, pathPos);
             newNode.isFinal = true;
 
             return newNode;
@@ -330,16 +371,35 @@ pub const Trie = struct {
         allocator: std.mem.Allocator,
         includeDirs: bool,
     ) error{OutOfMemory}!void {
+        // The walk copies a state per edge, so use one just big enough for the query
+        switch (fuzzy.lanesFor(matcher.len)) {
+            8 => try self.fuzzySearchL(8, matcher, top, allocator, includeDirs),
+            16 => try self.fuzzySearchL(16, matcher, top, allocator, includeDirs),
+            32 => try self.fuzzySearchL(32, matcher, top, allocator, includeDirs),
+            else => try self.fuzzySearchL(fuzzy.max_query_len, matcher, top, allocator, includeDirs),
+        }
+    }
+
+    fn fuzzySearchL(
+        self: *Trie,
+        comptime L: usize,
+        matcher: *const fuzzy.Matcher,
+        top: *fuzzy.TopK([]u8),
+        allocator: std.mem.Allocator,
+        includeDirs: bool,
+    ) error{OutOfMemory}!void {
         var path: std.ArrayList(u8) = .empty;
         defer path.deinit(allocator);
 
-        try self.fuzzyWalk(matcher, matcher.start(), &path, top, allocator, includeDirs);
+        var state: fuzzy.StateOf(L) = .{};
+        try self.fuzzyWalk(L, matcher, &state, &path, top, allocator, includeDirs);
     }
 
     fn fuzzyWalk(
         self: *Trie,
+        comptime L: usize,
         matcher: *const fuzzy.Matcher,
-        state: fuzzy.State,
+        state: *const fuzzy.StateOf(L),
         path: *std.ArrayList(u8),
         top: *fuzzy.TopK([]u8),
         allocator: std.mem.Allocator,
@@ -347,7 +407,7 @@ pub const Trie = struct {
     ) error{OutOfMemory}!void {
         const items = path.items;
         if (self.isFinal and items.len > 0 and (includeDirs or items[items.len - 1] != '/')) {
-            if (matcher.finish(&state)) |score| {
+            if (matcher.finish(state)) |score| {
                 const tiebreak: u32 = @intCast(@min(items.len, std.math.maxInt(u32)));
                 if (top.accepts(score, tiebreak)) {
                     const copy = try allocator.dupe(u8, items);
@@ -360,14 +420,18 @@ pub const Trie = struct {
         while (node) |n| : (node = n.next) {
             const child: *TrieChild = @fieldParentPtr("node", n);
 
-            var childState = state;
+            // Skip subtrees whose best possible score can't produce a result
+            const bound = matcher.subtreeBound(state, child.trie.sub);
+            if (!matcher.canReach(bound, top.threshold())) continue;
+
+            var childState = state.*;
             matcher.feed(&childState, child.path);
 
             const len = path.items.len;
             try path.appendSlice(allocator, child.path);
             defer path.shrinkRetainingCapacity(len);
 
-            try child.trie.fuzzyWalk(matcher, childState, path, top, allocator, includeDirs);
+            try child.trie.fuzzyWalk(L, matcher, &childState, path, top, allocator, includeDirs);
         }
     }
 
@@ -391,6 +455,21 @@ pub const Trie = struct {
         return self.queryInternal(word, f, 0);
     }
 };
+
+/// For tests: every node's mask covers its incoming label and its children's
+/// masks, and every child points back at its parent.
+pub fn masksAreConsistent(self: *Trie) bool {
+    var node = self.children.first;
+    while (node) |n| : (node = n.next) {
+        const child: *TrieChild = @fieldParentPtr("node", n);
+        if (child.trie.parent != self) return false;
+        const need = fuzzy.labelMask(child.path);
+        if (child.trie.sub & need != need) return false;
+        if (self.parent != null and self.sub & child.trie.sub != child.trie.sub) return false;
+        if (!masksAreConsistent(child.trie)) return false;
+    }
+    return true;
+}
 
 pub fn init(allocator: *std.mem.Allocator) !*Trie {
     const t = try allocator.create(Trie);
@@ -554,4 +633,20 @@ test "removeSingle" {
     try std.testing.expectEqual(null, trie.removeSingle("hel"));
     try std.testing.expectEqual(null, trie.removeSingle(""));
     try std.testing.expectEqual(3, try trie.query("he", &allocator));
+}
+
+test "masks and parents stay consistent through adds and splits" {
+    var allocator = std.heap.page_allocator;
+    const trie = try init(&allocator);
+    defer trie.destroy(&allocator);
+
+    for ([_][]const u8{ "hello", "hell", "heaven", "he", "help/me", "help/you", "x/y/z", "x/yy" }) |w| {
+        _ = try trie.add(w, &allocator, &allocator);
+        try std.testing.expect(masksAreConsistent(trie));
+    }
+    // Adding below a position deep in the trie reaches the masks above it
+    const sub = try trie.add("deep/", &allocator, &allocator);
+    _ = try sub.add("qqq", &allocator, &allocator);
+    try std.testing.expect(masksAreConsistent(trie));
+    try std.testing.expect(trie.getChildPtr('d').?.trie.sub & fuzzy.byteBit('q') != 0);
 }

@@ -150,8 +150,7 @@ pub const FileIndex = struct {
         const moved = try toPosition.add(toKey, self.allocator, self.stringAllocator);
 
         // An existing folder at the destination is replaced
-        moved.destroyChildren(self.allocator);
-        moved.children = old.children;
+        moved.adoptChildren(old, self.allocator);
         self.allocator.destroy(old);
         return true;
     }
@@ -326,6 +325,12 @@ test "removed and moved folders are freed" {
     try std.testing.expectEqual(0, try index.query("old.txt"));
     try std.testing.expectEqual(1, try index.query("d/b/f.txt"));
 
+    // The moved contents' bytes are now covered by the destination's masks
+    try std.testing.expect(trie.masksAreConsistent(index.trie));
+    const found = try index.search(std.heap.page_allocator, "dbftxt", .{});
+    defer freeSearchResults(std.heap.page_allocator, found);
+    try std.testing.expectEqualStrings("/r/d/b/f.txt", found[0].path);
+
     try std.testing.expectEqual(true, try index.removeFileName(root, "d", true));
     try std.testing.expectEqual(true, try index.removeFileName(root, "e", true));
     try std.testing.expectEqual(1, index.trie.countFinalNodes());
@@ -355,9 +360,10 @@ test "fuzzy search ranks full paths, best first" {
     defer index.trie.destroy(&allocator);
     try buildSearchFixture(index);
 
+    // Every entry gets a score; the real match leads
     const results = try index.search(allocator, "fidx", .{});
     defer freeSearchResults(allocator, results);
-    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(usize, 9), results.len);
     try std.testing.expectEqualStrings("/p/src/file-index.zig", results[0].path);
 
     const mains = try index.search(allocator, "main", .{});
@@ -365,9 +371,11 @@ test "fuzzy search ranks full paths, best first" {
     try std.testing.expect(mains.len >= 1);
     try std.testing.expectEqualStrings("/p/src/main.zig", mains[0].path);
 
-    const none = try index.search(allocator, "qqq", .{});
+    // Nothing in common still ranks something: the best of the typo matches
+    const none = try index.search(allocator, "qqq", .{ .limit = 2 });
     defer freeSearchResults(allocator, none);
-    try std.testing.expectEqual(@as(usize, 0), none.len);
+    try std.testing.expectEqual(@as(usize, 2), none.len);
+    try std.testing.expect(none[0].score < mains[0].score);
 }
 
 test "fuzzy search respects the limit and can leave out directories" {
@@ -454,5 +462,62 @@ test "a directory comes before its own contents when the query names it" {
         const results = try index.search(allocator, q, .{ .limit = 3 });
         defer freeSearchResults(allocator, results);
         try std.testing.expectEqualStrings("/p/src/", results[0].path);
+    }
+}
+
+test "pruned search returns the same top results as scoring every path" {
+    var allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var strings = arena.allocator();
+
+    const index = try init(&allocator, &strings, std.testing.io);
+    defer allocator.destroy(index);
+    defer index.trie.destroy(&allocator);
+
+    // Random folders and files over a small alphabet, so names share prefixes
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    const alphabet = "abcdmainzgtrx._-";
+    const root = try index.addFileName(index.rootPosition(), "/r", true);
+    for (0..400) |_| {
+        var buf: [40]u8 = undefined;
+        var len: usize = 0;
+        const parts = rnd.intRangeAtMost(usize, 1, 4);
+        for (0..parts) |p| {
+            if (p > 0) {
+                buf[len] = '/';
+                len += 1;
+            }
+            for (0..rnd.intRangeAtMost(usize, 1, 6)) |_| {
+                buf[len] = alphabet[rnd.uintLessThan(usize, alphabet.len)];
+                len += 1;
+            }
+        }
+        _ = try index.addFileName(root, buf[0..len], false);
+    }
+    const everything = try index.search(allocator, "", .{ .limit = 10_000 });
+    defer freeSearchResults(allocator, everything);
+
+    for ([_][]const u8{ "a", "ma", "main", "mxin", "zig", "trie", "abc", "x.z", "dmain", "qqqq" }) |q| {
+        for ([_]usize{ 1, 5, 20 }) |limit| {
+            const got = try index.search(allocator, q, .{ .limit = limit });
+            defer freeSearchResults(allocator, got);
+
+            // Ties may be ordered differently, but (score, length) pairs may not
+            const m = try fuzzy.Matcher.init(q, .{});
+            const buf = try allocator.alloc(fuzzy.TopK(void).Entry, limit);
+            defer allocator.free(buf);
+            var top = fuzzy.TopK(void).init(buf);
+            for (everything) |e| {
+                if (m.score(e.path)) |sc| _ = top.push(sc, @intCast(e.path.len), {});
+            }
+
+            try std.testing.expectEqual(top.items().len, got.len);
+            for (top.items(), got) |want, g| {
+                try std.testing.expectEqual(want.score, g.score);
+                try std.testing.expectEqual(want.tiebreak, @as(u32, @intCast(g.path.len)));
+            }
+        }
     }
 }

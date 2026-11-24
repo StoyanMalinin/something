@@ -14,7 +14,7 @@ pub fn walkSingleThreaded(dir: *std.Io.Dir, position: fileIndex.Position) !i32 {
         if (entry.kind == std.Io.File.Kind.directory) {
             var subDir: ?std.Io.Dir = dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false }) catch |err|
                 switch (err) {
-                    error.PermissionDenied => null,
+                    error.PermissionDenied, error.AccessDenied => null,
                     else => |leftoverErr| return leftoverErr,
                 };
 
