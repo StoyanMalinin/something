@@ -1,7 +1,23 @@
 const std = @import("std");
 const trie = @import("trie.zig");
+const fuzzy = @import("fuzzy.zig");
 
 pub const Position = *trie.Trie;
+
+pub const SearchOptions = struct {
+    limit: usize = 50,
+    includeDirs: bool = true,
+};
+
+pub const SearchResult = struct {
+    score: i32,
+    path: []u8,
+};
+
+pub fn freeSearchResults(allocator: std.mem.Allocator, results: []SearchResult) void {
+    for (results) |r| allocator.free(r.path);
+    allocator.free(results);
+}
 
 const separator = '/';
 const KeyBuf = [std.Io.Dir.max_path_bytes + 1]u8;
@@ -45,6 +61,33 @@ pub const FileIndex = struct {
         defer self.mut.unlock(self.io);
 
         return self.trie.query(name, self.allocator);
+    }
+
+    pub fn search(
+        self: *FileIndex,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        options: SearchOptions,
+    ) ![]SearchResult {
+        const matcher = try fuzzy.Matcher.init(text, .{});
+
+        const buf = try allocator.alloc(fuzzy.TopK([]u8).Entry, options.limit);
+        defer allocator.free(buf);
+        var top = fuzzy.TopK([]u8).init(buf);
+        errdefer for (top.items()) |e| allocator.free(e.item);
+
+        {
+            self.mut.lockUncancelable(self.io);
+            defer self.mut.unlock(self.io);
+
+            try self.trie.fuzzySearch(&matcher, &top, allocator, options.includeDirs);
+        }
+
+        const results = try allocator.alloc(SearchResult, top.len);
+        for (top.items(), results) |e, *r| {
+            r.* = .{ .score = e.score, .path = e.item };
+        }
+        return results;
     }
 
     pub fn removeFileName(self: *FileIndex, position: *trie.Trie, name: []const u8, isDir: bool) !bool {
@@ -286,4 +329,130 @@ test "removed and moved folders are freed" {
     try std.testing.expectEqual(true, try index.removeFileName(root, "d", true));
     try std.testing.expectEqual(true, try index.removeFileName(root, "e", true));
     try std.testing.expectEqual(1, index.trie.countFinalNodes());
+}
+
+fn buildSearchFixture(index: *FileIndex) !void {
+    // /p/ with src/{main,trie,file-index,watcher}.zig, build.zig, docs/, docs/notes.md
+    const root = try index.addFileName(index.rootPosition(), "/p", true);
+    const src = try index.addFileName(root, "src", true);
+    _ = try index.addFileName(src, "main.zig", false);
+    _ = try index.addFileName(src, "trie.zig", false);
+    _ = try index.addFileName(src, "file-index.zig", false);
+    _ = try index.addFileName(src, "watcher.zig", false);
+    _ = try index.addFileName(root, "build.zig", false);
+    const docs = try index.addFileName(root, "docs", true);
+    _ = try index.addFileName(docs, "notes.md", false);
+}
+
+test "fuzzy search ranks full paths, best first" {
+    var allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var strings = arena.allocator();
+
+    const index = try init(&allocator, &strings, std.testing.io);
+    defer allocator.destroy(index);
+    defer index.trie.destroy(&allocator);
+    try buildSearchFixture(index);
+
+    const results = try index.search(allocator, "fidx", .{});
+    defer freeSearchResults(allocator, results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("/p/src/file-index.zig", results[0].path);
+
+    const mains = try index.search(allocator, "main", .{});
+    defer freeSearchResults(allocator, mains);
+    try std.testing.expect(mains.len >= 1);
+    try std.testing.expectEqualStrings("/p/src/main.zig", mains[0].path);
+
+    const none = try index.search(allocator, "qqq", .{});
+    defer freeSearchResults(allocator, none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "fuzzy search respects the limit and can leave out directories" {
+    var allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var strings = arena.allocator();
+
+    const index = try init(&allocator, &strings, std.testing.io);
+    defer allocator.destroy(index);
+    defer index.trie.destroy(&allocator);
+    try buildSearchFixture(index);
+
+    // Empty query matches every entry: /p/, src/, docs/ and 6 files
+    const all = try index.search(allocator, "", .{ .limit = 100 });
+    defer freeSearchResults(allocator, all);
+    try std.testing.expectEqual(@as(usize, 9), all.len);
+
+    const files = try index.search(allocator, "", .{ .limit = 100, .includeDirs = false });
+    defer freeSearchResults(allocator, files);
+    try std.testing.expectEqual(@as(usize, 6), files.len);
+    for (files) |r| try std.testing.expect(!std.mem.endsWith(u8, r.path, "/"));
+
+    const two = try index.search(allocator, "zig", .{ .limit = 2 });
+    defer freeSearchResults(allocator, two);
+    try std.testing.expectEqual(@as(usize, 2), two.len);
+    try std.testing.expect(two[0].score >= two[1].score);
+
+    const dirs = try index.search(allocator, "docs", .{});
+    defer freeSearchResults(allocator, dirs);
+    try std.testing.expectEqualStrings("/p/docs/", dirs[0].path);
+}
+
+test "fuzzy search over the trie matches scoring each path on its own" {
+    var allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var strings = arena.allocator();
+
+    const index = try init(&allocator, &strings, std.testing.io);
+    defer allocator.destroy(index);
+    defer index.trie.destroy(&allocator);
+    try buildSearchFixture(index);
+
+    const all = try index.search(allocator, "", .{ .limit = 100 });
+    defer freeSearchResults(allocator, all);
+
+    for ([_][]const u8{ "zig", "src", "tz", "pn", "w", "/" }) |q| {
+        const m = try fuzzy.Matcher.init(q, .{});
+
+        // Best scores by scoring every path in one go
+        var expected: [16]i32 = undefined;
+        var n: usize = 0;
+        for (all) |r| {
+            if (m.score(r.path)) |s| {
+                expected[n] = s;
+                n += 1;
+            }
+        }
+        std.mem.sort(i32, expected[0..n], {}, std.sort.desc(i32));
+
+        const got = try index.search(allocator, q, .{ .limit = 3 });
+        defer freeSearchResults(allocator, got);
+        try std.testing.expectEqual(@min(n, 3), got.len);
+        for (got, 0..) |r, i| {
+            try std.testing.expectEqual(m.score(r.path).?, r.score);
+            try std.testing.expectEqual(expected[i], r.score);
+        }
+    }
+}
+
+test "a directory comes before its own contents when the query names it" {
+    var allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var strings = arena.allocator();
+
+    const index = try init(&allocator, &strings, std.testing.io);
+    defer allocator.destroy(index);
+    defer index.trie.destroy(&allocator);
+    try buildSearchFixture(index);
+
+    for ([_][]const u8{ "src/", "src" }) |q| {
+        const results = try index.search(allocator, q, .{ .limit = 3 });
+        defer freeSearchResults(allocator, results);
+        try std.testing.expectEqualStrings("/p/src/", results[0].path);
+    }
 }

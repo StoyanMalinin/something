@@ -192,8 +192,6 @@ fn onFsEvent(_: ?*anyopaque, event: watcher.Event) void {
     }
 }
 
-// The watcher delivers its events on its own dispatch queue, so this thread is free to answer
-// queries while the index changes underneath it.
 fn queryLoop() !void {
     var buf: [4096]u8 = undefined;
     var stdin = std.Io.File.stdin().reader(io, &buf);
@@ -207,9 +205,17 @@ fn queryLoop() !void {
         if (std.mem.eql(u8, word, ":q")) return;
 
         const startTime = std.Io.Clock.awake.now(io);
-        const cnt = try index.query(word);
+        const searchResult = try index.search(gpa, word, .{ .limit = 10 });
         const endTime = std.Io.Clock.awake.now(io);
-        std.debug.print("{d} matches in {d}ms\n", .{ cnt, startTime.durationTo(endTime).toMilliseconds() });
+
+        std.debug.print("{d} matches in {d}ms\n", .{ searchResult.len, startTime.durationTo(endTime).toMilliseconds() });
+        for (searchResult) |result| {
+            std.debug.print("{d} {s}\n", .{ result.score, result.path });
+        }
+
+        for (searchResult) |result| {
+            gpa.free(result.path);
+        }
     }
 }
 

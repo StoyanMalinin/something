@@ -1,4 +1,5 @@
 const std = @import("std");
+const fuzzy = @import("fuzzy.zig");
 
 const TrieChild = struct {
     path: []const u8,
@@ -320,6 +321,54 @@ pub const Trie = struct {
         }
 
         return cnt;
+    }
+
+    pub fn fuzzySearch(
+        self: *Trie,
+        matcher: *const fuzzy.Matcher,
+        top: *fuzzy.TopK([]u8),
+        allocator: std.mem.Allocator,
+        includeDirs: bool,
+    ) error{OutOfMemory}!void {
+        var path: std.ArrayList(u8) = .empty;
+        defer path.deinit(allocator);
+
+        try self.fuzzyWalk(matcher, matcher.start(), &path, top, allocator, includeDirs);
+    }
+
+    fn fuzzyWalk(
+        self: *Trie,
+        matcher: *const fuzzy.Matcher,
+        state: fuzzy.State,
+        path: *std.ArrayList(u8),
+        top: *fuzzy.TopK([]u8),
+        allocator: std.mem.Allocator,
+        includeDirs: bool,
+    ) error{OutOfMemory}!void {
+        const items = path.items;
+        if (self.isFinal and items.len > 0 and (includeDirs or items[items.len - 1] != '/')) {
+            if (matcher.finish(&state)) |score| {
+                const tiebreak: u32 = @intCast(@min(items.len, std.math.maxInt(u32)));
+                if (top.accepts(score, tiebreak)) {
+                    const copy = try allocator.dupe(u8, items);
+                    if (top.push(score, tiebreak, copy)) |dropped| allocator.free(dropped);
+                }
+            }
+        }
+
+        var node = self.children.first;
+        while (node) |n| : (node = n.next) {
+            const child: *TrieChild = @fieldParentPtr("node", n);
+
+            var childState = state;
+            matcher.feed(&childState, child.path);
+
+            const len = path.items.len;
+            try path.appendSlice(allocator, child.path);
+            defer path.shrinkRetainingCapacity(len);
+
+            try child.trie.fuzzyWalk(matcher, childState, path, top, allocator, includeDirs);
+        }
     }
 
     pub fn query(self: *Trie, word: []const u8, allocator: *std.mem.Allocator) !usize {
