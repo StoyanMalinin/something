@@ -12,9 +12,9 @@ fn walkSingleThreaded(dir: *std.Io.Dir, position: fileIndex.Position) !i32 {
         const subPosition = try index.addFileName(position, entry.name, entry.kind == std.Io.File.Kind.directory);
 
         if (entry.kind == std.Io.File.Kind.directory) {
-            var subDir: ?std.Io.Dir = dir.openDir(io, entry.name, .{ .iterate = true }) catch |err|
+            var subDir: ?std.Io.Dir = dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false }) catch |err|
                 switch (err) {
-                    error.AccessDenied => null,
+                    error.PermissionDenied => null,
                     else => |leftoverErr| return leftoverErr,
                 };
 
@@ -95,7 +95,7 @@ fn walk(path: []const u8) !i32 {
                 const subDir = try gpa.create(?std.Io.Dir);
                 subDir.* = item.dir.*.?.openDir(io, entry.name, .{ .iterate = true }) catch |err|
                     switch (err) {
-                        error.AccessDenied => null,
+                        error.PermissionDenied => null,
                         else => |leftoverErr| return leftoverErr,
                     };
 
@@ -181,15 +181,12 @@ fn reportIndexError(what: []const u8, path: []const u8, err: anyerror) void {
 fn onFsEvent(_: ?*anyopaque, event: watcher.Event) void {
     switch (event) {
         .add => |e| {
-            std.debug.print("fs event: add {s} ({s})\n", .{ e.path, @tagName(e.kind) });
             addToIndex(e.path, e.kind) catch |err| reportIndexError("add", e.path, err);
         },
         .remove => |e| {
-            std.debug.print("fs event: remove {s} ({s})\n", .{ e.path, @tagName(e.kind) });
             removeFromIndex(e.path, e.kind) catch |err| reportIndexError("remove", e.path, err);
         },
         .move => |e| {
-            std.debug.print("fs event: move {s} -> {s} ({s})\n", .{ e.from, e.to, @tagName(e.kind) });
             moveInIndex(e.from, e.to, e.kind) catch |err| reportIndexError("move", e.to, err);
         },
     }
@@ -216,22 +213,30 @@ fn queryLoop() !void {
     }
 }
 
+pub fn createIndex(path: []const u8) !void {
+    var _stringAllocator = std.heap.FixedBufferAllocator.init(
+        try std.heap.page_allocator.alloc(u8, 40 * 1024 * 1024), // 40 MB
+    );
+    var stringAllocator = _stringAllocator.allocator();
+
+    index = try fileIndex.init(&gpa, &stringAllocator, io);
+
+    const startTime = std.Io.Clock.awake.now(io);
+    const cnt = try walk(path);
+    const endTime = std.Io.Clock.awake.now(io);
+
+    std.debug.print("Indexing took {d}ms\n", .{startTime.durationTo(endTime).toMilliseconds()});
+    std.debug.print("Total files: {d}\n", .{cnt});
+}
+
 pub fn main(init: std.process.Init) !void {
     gpa = init.gpa;
     io = init.io;
 
-    var _stringAllocator = std.heap.FixedBufferAllocator.init(
-        try std.heap.page_allocator.alloc(u8, 30 * 1024 * 1024), // 30 MB
-    );
-    var stringAllocator = _stringAllocator.allocator();
-
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    // FSEvents reports absolute, resolved paths, so the index has to be built from the same
     const path = try std.Io.Dir.cwd().realPathFileAlloc(io, if (args.len > 1) args[1] else "/", init.arena.allocator());
-    index = try fileIndex.init(&gpa, &stringAllocator, io);
 
-    const cnt = try walk(path);
-    std.debug.print("Total files: {d}\n", .{cnt});
+    try createIndex(path);
 
     const fsWatcher = try watcher.Watcher.start(gpa, path, 0.1, onFsEvent, null);
     defer fsWatcher.stop(gpa);
