@@ -149,6 +149,9 @@ pub const Matcher = struct {
     /// isn't a letter or digit earns no bonus of its own: off when the config
     /// makes that unsafe (see `init`).
     own_class_cap: bool,
+    /// The mask bits `subtreeBound` looks at to tell which query bytes are
+    /// present: every `query_bits`, and `upper_bit`. For `BoundKey`.
+    bound_bits: u64,
     config: Config,
 
     pub fn init(query: []const u8, config: Config) error{QueryTooLong}!Matcher {
@@ -166,6 +169,7 @@ pub const Matcher = struct {
             .pair_any = @splat(@splat(unlimited)),
             .pair_own = @splat(@splat(unlimited)),
             .own_class_cap = false,
+            .bound_bits = upper_bit,
             .config = config,
         };
         for (&self.prev_bonus, 0..) |*b, c| b.* = switch (byte_class[c]) {
@@ -193,6 +197,7 @@ pub const Matcher = struct {
             self.query_bits[i] = byteBit(self.query[i]);
             // An exact match of an uppercase byte needs one below
             if (self.case_sensitive and std.ascii.isUpper(c)) self.query_bits[i] |= upper_bit;
+            self.bound_bits |= self.query_bits[i];
         }
 
         // The cap moves bonus a byte can earn after a typo or a dropped query
@@ -335,16 +340,67 @@ pub const Matcher = struct {
     /// otherwise a typo, with the largest bonus it can earn there. Starting
     /// over at any query byte, dropping the ones before it, is covered too.
     pub fn subtreeBound(self: *const Matcher, state: anytype, mask: u64) i32 {
-        const n = self.len;
-        if (n == 0) return 0;
+        if (self.len == 0) return 0;
         const L = @TypeOf(state.full).lanes;
-        std.debug.assert(n <= L);
-        const V = @Vector(L, Score);
-        const cfg = &self.config;
+        const key = self.boundKey(state.prev, mask);
+        return self.combineBound(state, self.boundParts(L, key));
+    }
+
+    /// `subtreeBound`, with the part that doesn't depend on the state taken
+    /// from `cache` (see `BoundCache`).
+    pub fn subtreeBoundCached(self: *const Matcher, state: anytype, mask: u64, cache: anytype) i32 {
+        if (self.len == 0) return 0;
+        const L = @TypeOf(state.full).lanes;
+        const key = self.boundKey(state.prev, mask);
+        const slot = cache.slot(key);
+        if (slot.key.mask != key.mask or slot.key.bonuses != key.bonuses) {
+            slot.* = .{ .key = key, .parts = self.boundParts(L, key) };
+            cache.misses += 1;
+        }
+        return self.combineBound(state, slot.parts);
+    }
+
+    /// All `subtreeBound` needs to know about the mask and `prev`: whether
+    /// each query byte is present (`mask` cut down to `bound_bits`), and the
+    /// largest bonuses a byte can earn there (`maxBonusWithin`) and right
+    /// after `prev` (`maxBonusBelow`).
+    pub const BoundKey = struct {
+        mask: u64,
+        /// `max_b_first` in the high half, `max_b` in the low one.
+        bonuses: u32,
+    };
+
+    fn boundKey(self: *const Matcher, prev: u8, mask: u64) BoundKey {
         // Only the first byte fed follows `prev`; every later one follows a
         // byte of the subtree, whose class is in the mask
-        const max_b_first = self.maxBonusBelow(state.prev, mask);
         const max_b = self.maxBonusWithin(mask);
+        // `maxBonusBelow`, reusing `max_b`
+        const max_b_first = @max(self.prev_bonus[prev], max_b);
+        const lo: u16 = @bitCast(max_b);
+        const hi: u16 = @bitCast(max_b_first);
+        return .{ .mask = mask & self.bound_bits, .bonuses = @as(u32, hi) << 16 | lo };
+    }
+
+    /// The part of `subtreeBound` that is the same for every state with the
+    /// same `BoundKey`.
+    pub fn BoundParts(comptime L: usize) type {
+        return struct {
+            /// The best alignment that starts below, whatever the state.
+            first: Score,
+            /// Lane j: what an alignment live at query[j] can still gain
+            /// below. Lanes from `len` up are padding.
+            tail: [L]Score,
+        };
+    }
+
+    fn boundParts(self: *const Matcher, comptime L: usize, key: BoundKey) BoundParts(L) {
+        const n = self.len;
+        std.debug.assert(n != 0 and n <= L);
+        const V = @Vector(L, Score);
+        const cfg = &self.config;
+        const mask = key.mask;
+        const max_b: Score = @bitCast(@as(u16, @truncate(key.bonuses)));
+        const max_b_first: Score = @bitCast(@as(u16, @truncate(key.bonuses >> 16)));
         const max_bv: V = @splat(max_b);
         const max_b_first_v: V = @splat(max_b_first);
         const exact: Score = cfg.score_match;
@@ -397,17 +453,28 @@ pub const Matcher = struct {
         const j_skip = std.simd.iota(Score, L) * @as(V, @splat(cfg.skip_penalty));
         const first_bonus = @select(Score, own_limited, zero, max_b_first_v);
         const first = match + first_bonus * @as(V, @splat(cfg.first_char_multiplier)) - j_skip + after;
-        // Or an alignment that is already live at j. The byte after it is the
-        // first one fed, after `prev`, which may be a typo the bound didn't
-        // credit, so it gets back the full bonus.
-        const live = @max(@as(V, state.full.m[0..L].*), @as(V, state.full.g[0..L].*));
+        // Or an alignment that is already live at j (see `combineBound`). The
+        // byte after it is the first one fed, after `prev`, which may be a
+        // typo the bound didn't credit, so it gets back the full bonus.
         const first_fed = @select(Score, own_limited, @min(consec, max_b_first_v), max_b_first_v);
         const uncap = shiftDown(L, @select(Score, in_query, first_fed - cap, zero), 1);
-        const neg: V = @splat(NEG);
-        const from_live = @select(Score, live > neg, live + after + uncap, neg);
 
-        const best = @select(Score, in_query, @max(first, from_live), @as(V, @splat(std.math.minInt(Score))));
-        return @max(@as(i32, state.full.done), @as(i32, @reduce(.Max, best)));
+        const firsts = @select(Score, in_query, first, @as(V, @splat(std.math.minInt(Score))));
+        return .{ .first = @reduce(.Max, firsts), .tail = after + uncap };
+    }
+
+    /// `subtreeBound` from its state-independent parts.
+    fn combineBound(self: *const Matcher, state: anytype, parts: anytype) i32 {
+        const L = @TypeOf(state.full).lanes;
+        const V = @Vector(L, Score);
+        const neg: V = @splat(NEG);
+        const in_query = std.simd.iota(u8, L) < @as(@Vector(L, u8), @splat(@intCast(self.len)));
+        const live = @max(@as(V, state.full.m[0..L].*), @as(V, state.full.g[0..L].*));
+        const counts = @select(bool, in_query, live > neg, @as(@Vector(L, bool), @splat(false)));
+        const tail: V = parts.tail[0..L].*;
+        const from_live = @select(Score, counts, live + tail, neg);
+        const best = @max(parts.first, @reduce(.Max, from_live));
+        return @max(@as(i32, state.full.done), @as(i32, best));
     }
 
     /// The largest bonus a byte can earn when the bytes fed next have classes
@@ -425,7 +492,7 @@ pub const Matcher = struct {
 
     /// The largest bonus a byte can earn when it and the byte before it both
     /// have classes in `mask`: `maxBonusBelow` without the `prev` part.
-    fn maxBonusWithin(self: *const Matcher, mask: u64) Score {
+    inline fn maxBonusWithin(self: *const Matcher, mask: u64) Score {
         const cfg = &self.config;
         const from_slash: Score = if (mask & byteBit('/') != 0) cfg.bonus_path_boundary else 0;
         const from_punct: Score = if (mask & punct_bits != 0) cfg.bonus_boundary else 0;
@@ -637,6 +704,28 @@ fn shiftUp(comptime L: usize, v: @Vector(L, Score), comptime k: usize) @Vector(L
         break :blk m;
     };
     return @shuffle(Score, v, @as(@Vector(L, Score), @splat(NEG)), mask);
+}
+
+/// Remembers `subtreeBound`'s state-independent part by `BoundKey`, for one
+/// search (one matcher): direct-mapped, a new key overwrites its slot. Few
+/// keys come up in a search, as a key only sees the mask bits of query bytes.
+pub fn BoundCache(comptime L: usize) type {
+    return struct {
+        const Self = @This();
+        const bits = 9;
+        pub const Slot = struct { key: Matcher.BoundKey, parts: Matcher.BoundParts(L) };
+        /// No real key: its mask would need every bit, and both bonuses -1.
+        const empty: Matcher.BoundKey = .{ .mask = ~@as(u64, 0), .bonuses = ~@as(u32, 0) };
+
+        slots: [1 << bits]Slot = @splat(.{ .key = empty, .parts = undefined }),
+        /// Lookups that had to compute the parts.
+        misses: u64 = 0,
+
+        pub fn slot(self: *Self, key: Matcher.BoundKey) *Slot {
+            const h = (key.mask ^ (@as(u64, key.bonuses) *% 0x9e3779b97f4a7c15)) *% 0xff51afd7ed558ccd;
+            return &self.slots[h >> (64 - bits)];
+        }
+    };
 }
 
 /// Keeps the `buf.len` best items, best first: higher score wins, then lower
@@ -1037,6 +1126,31 @@ test "subtreeBound never undercuts what feeding the rest can reach" {
                 if (!reachable) try testing.expect(m.finish(&state, cand).? < threshold);
             }
         }
+    }
+}
+
+test "the cached subtreeBound is the uncached one" {
+    var prng = std.Random.DefaultPrng.init(13);
+    const rnd = prng.random();
+    const alphabet = "abcmainzigMAxYBIN/._- 12+\xc3";
+    const queries = [_][]const u8{ "a", "main", "mxin", "Main", "x/Y.z", "-ma", "M1a", "a.-b", "abcdefghijklmnopq", "lib/python3/site-packages/requests" };
+
+    for (queries) |q| {
+        const m = try Matcher.init(q, .{});
+        // A small cache, so slots get overwritten
+        var cache: BoundCache(max_query_len) = .{};
+        for (0..2000) |_| {
+            var buf: [24]u8 = undefined;
+            const len = rnd.intRangeAtMost(usize, 1, buf.len);
+            for (buf[0..len]) |*c| c.* = alphabet[rnd.uintLessThan(usize, alphabet.len)];
+            const split = rnd.uintLessThan(usize, len);
+            var state = m.start();
+            m.feed(&state, buf[0..split]);
+            const mask = labelMask(buf[split..len]);
+            try testing.expectEqual(m.subtreeBound(&state, mask), m.subtreeBoundCached(&state, mask, &cache));
+        }
+        // Repeats were found
+        try testing.expect(cache.misses < 2000);
     }
 }
 

@@ -79,6 +79,29 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
+    // The daemon and its Raycast front end (raycast/) are opt-in: the default
+    // install step builds only the REPL. `zig build daemon` builds zig-out/bin/something-daemon,
+    // `zig build run-daemon -- [root]` runs it.
+    const daemon_mod = b.createModule(.{
+        .root_source_file = b.path("src/daemon.zig"),
+        .target = target,
+        .optimize = optimize,
+        .omit_frame_pointer = if (keep_frame_pointers) false else null,
+    });
+    daemon_mod.addImport("c", c_mod);
+    daemon_mod.addOptions("build_options", options);
+    const daemon_exe = b.addExecutable(.{
+        .name = "something-daemon",
+        .root_module = daemon_mod,
+    });
+    const install_daemon = b.addInstallArtifact(daemon_exe, .{});
+    b.step("daemon", "Build the query daemon").dependOn(&install_daemon.step);
+
+    const run_daemon = b.addRunArtifact(daemon_exe);
+    run_daemon.step.dependOn(&install_daemon.step);
+    run_daemon.addPassthruArgs();
+    b.step("run-daemon", "Run the query daemon").dependOn(&run_daemon.step);
+
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_mod,
     });

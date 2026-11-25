@@ -48,6 +48,8 @@ pub const SearchStats = struct {
     finals_seen: u64 = 0,
     finals_scored: u64 = 0,
     finals_kept: u64 = 0,
+    /// `subtreeBound`s computed in full; the other children seen hit the cache.
+    bound_misses: u64 = 0,
 };
 
 pub const Index = enum(u32) {
@@ -811,8 +813,10 @@ pub const Trie = struct {
         defer path.deinit(allocator);
 
         var state: fuzzy.StateOf(L) = .{};
+        var cache: fuzzy.BoundCache(L) = .{};
         self.stats = .{};
-        try self.fuzzyWalk(L, self.entry(0), matcher, &state, &path, top, allocator, includeDirs);
+        try self.fuzzyWalk(L, self.entry(0), matcher, &state, &cache, &path, top, allocator, includeDirs);
+        if (collect_stats) self.stats.bound_misses = cache.misses;
     }
 
     /// Scores `items`, a final word the walk has fed into `state`, and keeps
@@ -848,6 +852,7 @@ pub const Trie = struct {
         e: Entry,
         matcher: *const fuzzy.Matcher,
         state: *const fuzzy.StateOf(L),
+        cache: *fuzzy.BoundCache(L),
         path: *std.ArrayList(u8),
         top: *fuzzy.TopK([]u8),
         allocator: std.mem.Allocator,
@@ -861,7 +866,7 @@ pub const Trie = struct {
             const lbl = self.labelOf(c);
             // Skip what can't produce a result; leaves have no stored mask
             const mask = if (c.internal) self.subAt(c) else fuzzy.labelMask(lbl);
-            const bound = matcher.subtreeBound(state, mask);
+            const bound = matcher.subtreeBoundCached(state, mask, cache);
             // Every word below is at least the path so far plus this label long
             const min_len = @min(path.items.len + lbl.len, std.math.maxInt(u32));
             const pass = matcher.canEnter(bound, top, @intCast(min_len));
@@ -888,7 +893,7 @@ pub const Trie = struct {
             defer path.shrinkRetainingCapacity(len);
 
             if (c.internal) {
-                try self.fuzzyWalk(L, c, matcher, &childState, path, top, allocator, includeDirs);
+                try self.fuzzyWalk(L, c, matcher, &childState, cache, path, top, allocator, includeDirs);
             } else {
                 try self.consider(L, matcher, &childState, path.items, top, allocator, includeDirs);
             }

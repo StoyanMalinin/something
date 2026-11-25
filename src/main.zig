@@ -1,6 +1,7 @@
 const std = @import("std");
 const fileIndex = @import("file-index.zig");
 const trie = @import("trie.zig");
+const indexer = @import("indexer.zig");
 const watcher = @import("watcher.zig");
 const walk = @import("walk.zig");
 
@@ -8,66 +9,6 @@ var index: *fileIndex.FileIndex = undefined;
 
 var gpa: std.mem.Allocator = undefined;
 var io: std.Io = undefined;
-const WalkErrorType = std.Io.Dir.OpenError || std.Thread.SpawnError || std.mem.Allocator.Error;
-
-fn scanFolder(path: []const u8, position: fileIndex.Position) !void {
-    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
-        // Gone again, replaced by a file, or not ours to read
-        error.FileNotFound, error.NotDir, error.AccessDenied => return,
-        else => return err,
-    };
-    defer dir.close(io);
-
-    _ = try walk.walkSingleThreaded(&dir, position);
-    try index.refreshMasks(position, path);
-}
-
-fn addToIndex(path: []const u8, kind: watcher.Kind) !void {
-    const position = try index.addFileName(index.rootPosition(), path, kind == .folder);
-
-    // Generally not necessary: new files are reported one by one, and the add is idempotent.
-    // It only matters for a folder that arrives already full (moved in from outside the
-    // watched tree, or one half of a rename that was split across batches), whose contents
-    // are not reported.
-    if (kind == .folder) {
-        try scanFolder(path, position);
-    }
-}
-
-fn removeFromIndex(path: []const u8, kind: watcher.Kind) !void {
-    _ = try index.removeFileName(index.rootPosition(), path, kind == .folder);
-}
-
-fn moveInIndex(from: []const u8, to: []const u8, kind: watcher.Kind) !void {
-    const root = index.rootPosition();
-    const moved = switch (kind) {
-        .file => try index.moveOrdinaryFile(root, from, root, to),
-        .folder => try index.moveFolder(root, from, root, to),
-    };
-
-    // The source was never indexed, so the destination is new to us
-    if (!moved) {
-        try addToIndex(to, kind);
-    }
-}
-
-fn reportIndexError(what: []const u8, path: []const u8, err: anyerror) void {
-    std.debug.print("index: {s} {s} failed: {any}\n", .{ what, path, err });
-}
-
-fn onFsEvent(_: ?*anyopaque, event: watcher.Event) void {
-    switch (event) {
-        .add => |e| {
-            addToIndex(e.path, e.kind) catch |err| reportIndexError("add", e.path, err);
-        },
-        .remove => |e| {
-            removeFromIndex(e.path, e.kind) catch |err| reportIndexError("remove", e.path, err);
-        },
-        .move => |e| {
-            moveInIndex(e.from, e.to, e.kind) catch |err| reportIndexError("move", e.to, err);
-        },
-    }
-}
 
 fn queryLoop() !void {
     var buf: [4096]u8 = undefined;
@@ -91,8 +32,8 @@ fn queryLoop() !void {
         if (trie.collect_stats) {
             const s = index.trie.stats;
             std.debug.print(
-                "stats: internal {d} seen {d} pruned, leaves {d} seen {d} pruned, bytes fed {d} internal {d} leaf, {d} pruned, finals {d} seen {d} scored {d} kept\n",
-                .{ s.internal_seen, s.internal_pruned, s.leaves_seen, s.leaves_pruned, s.internal_bytes_fed, s.leaf_bytes_fed, s.bytes_pruned, s.finals_seen, s.finals_scored, s.finals_kept },
+                "stats: internal {d} seen {d} pruned, leaves {d} seen {d} pruned, bytes fed {d} internal {d} leaf, {d} pruned, finals {d} seen {d} scored {d} kept, bound misses {d}\n",
+                .{ s.internal_seen, s.internal_pruned, s.leaves_seen, s.leaves_pruned, s.internal_bytes_fed, s.leaf_bytes_fed, s.bytes_pruned, s.finals_seen, s.finals_scored, s.finals_kept, s.bound_misses },
             );
         }
         for (searchResult) |result| {
@@ -105,40 +46,16 @@ fn queryLoop() !void {
     }
 }
 
-pub fn createIndex(path: []const u8) !void {
-    // Reserves the trie's node and label buffers at their largest; pages are
-    // only backed as they fill up
-    index = try fileIndex.init(gpa, io, .{});
-
-    const startTime = std.Io.Clock.awake.now(io);
-    walk.index = index;
-    // The walk adds into a plain trie, packed into the search trie once done
-    try index.beginBulk();
-    const cnt = try walk.walk(path);
-    const walkedTime = std.Io.Clock.awake.now(io);
-    try index.endBulk();
-    const endTime = std.Io.Clock.awake.now(io);
-
-    std.debug.print("Indexing took {d}ms (packing {d}ms)\n", .{
-        startTime.durationTo(endTime).toMilliseconds(),
-        walkedTime.durationTo(endTime).toMilliseconds(),
-    });
-    std.debug.print("Total files: {d}\n", .{cnt});
-}
-
 pub fn main(init: std.process.Init) !void {
     gpa = init.gpa;
     io = init.io;
-    walk.gpa = gpa;
-    walk.io = io;
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const path = try std.Io.Dir.cwd().realPathFileAlloc(io, if (args.len > 1) args[1] else "/", init.arena.allocator());
 
-    try createIndex(path);
-
-    const fsWatcher = try watcher.Watcher.start(gpa, path, 0.1, onFsEvent, null);
+    const fsWatcher = try indexer.start(gpa, io, path);
     defer fsWatcher.stop(gpa);
+    index = indexer.index;
 
     const passsthroughCnt = index.trie.scanPassthoughNodes();
     const allCnt = index.trie.scanAllNodes();
@@ -170,6 +87,7 @@ pub fn main(init: std.process.Init) !void {
 test {
     // Pull in the other files' tests; `zig build test` is rooted here
     _ = fileIndex;
+    _ = indexer;
     _ = trie;
     _ = watcher;
     _ = walk;
