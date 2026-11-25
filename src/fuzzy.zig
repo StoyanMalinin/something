@@ -122,8 +122,9 @@ pub const State = StateOf(max_query_len);
 
 pub const Matcher = struct {
     query: [max_query_len]u8,
-    /// `byteBit` of each query byte, for `subtreeBound`, which runs once per
-    /// child visited.
+    /// `byteBit` of each query byte, plus `upper_bit` for an uppercase byte
+    /// of a case-sensitive query: the bits a mask needs for an exact match.
+    /// For `subtreeBound`, which runs once per child visited.
     query_bits: [max_query_len]u64,
     len: usize,
     case_sensitive: bool,
@@ -136,10 +137,18 @@ pub const Matcher = struct {
     /// bonus. For `maxBonusBelow`.
     prev_bonus: [256]Score,
     /// Lane j: the largest bonus query[j] can earn when it directly follows
-    /// an exact match of query[j-1], given only query[j-1]'s byte class. At
-    /// least the consecutive bonus. For `subtreeBound`; huge when the config
-    /// makes the cap unsafe (see `init`), which turns it off.
-    pair_cap: [max_query_len]Score,
+    /// an exact match of query[j-1]. At least the consecutive bonus. For
+    /// `subtreeBound`; huge when the config makes the cap unsafe (see
+    /// `init`), which turns it off. Indexed by whether an uppercase letter
+    /// may occur below (see `upper_bit`):
+    ///   `pair_any`: whatever query[j] is matched to (it may be a typo)
+    ///   `pair_own`: query[j] matched exactly
+    pair_any: [2][max_query_len]Score,
+    pair_own: [2][max_query_len]Score,
+    /// Whether `subtreeBound` may assume an exact match of a query byte that
+    /// isn't a letter or digit earns no bonus of its own: off when the config
+    /// makes that unsafe (see `init`).
+    own_class_cap: bool,
     config: Config,
 
     pub fn init(query: []const u8, config: Config) error{QueryTooLong}!Matcher {
@@ -154,7 +163,9 @@ pub const Matcher = struct {
             .fold_table = &lowercase_table,
             .bonus_table = undefined,
             .prev_bonus = undefined,
-            .pair_cap = @splat(std.math.maxInt(Score) / 4),
+            .pair_any = @splat(@splat(unlimited)),
+            .pair_own = @splat(@splat(unlimited)),
+            .own_class_cap = false,
             .config = config,
         };
         for (&self.prev_bonus, 0..) |*b, c| b.* = switch (byte_class[c]) {
@@ -180,6 +191,8 @@ pub const Matcher = struct {
         for (query, 0..) |c, i| {
             self.query[i] = self.fold(c);
             self.query_bits[i] = byteBit(self.query[i]);
+            // An exact match of an uppercase byte needs one below
+            if (self.case_sensitive and std.ascii.isUpper(c)) self.query_bits[i] |= upper_bit;
         }
 
         // The cap moves bonus a byte can earn after a typo or a dropped query
@@ -190,19 +203,45 @@ pub const Matcher = struct {
             config.typo_penalty >= max_bonus and config.score_match + config.skip_penalty >= max_bonus;
         if (caps_safe and query.len > 1) {
             for (1..query.len) |j| {
-                const q = self.query[j - 1];
-                const cls = byte_class[q];
-                // A folded lowercase letter may stand for an uppercase one
-                const alt: ByteClass = if (!self.case_sensitive and cls == .lower) .upper else cls;
-                var best: Score = config.bonus_consecutive;
-                for (0..byte_classes) |y| {
-                    best = @max(best, self.bonus_table[@backingInt(cls)][y]);
-                    best = @max(best, self.bonus_table[@backingInt(alt)][y]);
+                for (0..2) |up| {
+                    const upper_below = up == 1;
+                    const xs = self.classesOf(self.query[j - 1], upper_below);
+                    const ys_own = self.classesOf(self.query[j], upper_below);
+                    const ys_any = if (upper_below) all_classes else all_classes & ~classBit(.upper);
+                    self.pair_any[up][j] = self.pairBonus(xs, ys_any);
+                    self.pair_own[up][j] = self.pairBonus(xs, ys_own);
                 }
-                self.pair_cap[j] = best;
             }
         }
+        // A present byte credited as exact but matched as a typo is credited
+        // `typo_penalty` too much, which must cover the bonus it may earn
+        // then, even as the first match
+        self.own_class_cap = caps_safe and
+            config.typo_penalty >= @as(i32, max_bonus) * config.first_char_multiplier;
         return self;
+    }
+
+    /// The classes the candidate byte matched to query byte `q` may have.
+    fn classesOf(self: *const Matcher, q: u8, upper_below: bool) u8 {
+        const cls = byte_class[q];
+        var set = classBit(cls);
+        // A folded lowercase letter may stand for an uppercase one
+        if (!self.case_sensitive and cls == .lower and upper_below) set |= classBit(.upper);
+        return set;
+    }
+
+    /// The largest bonus a byte of a class in `ys` earns right after one of
+    /// a class in `xs`, at least the consecutive bonus.
+    fn pairBonus(self: *const Matcher, xs: u8, ys: u8) Score {
+        var best: Score = self.config.bonus_consecutive;
+        for (0..byte_classes) |x| {
+            if (xs & (@as(u8, 1) << @intCast(x)) == 0) continue;
+            for (0..byte_classes) |y| {
+                if (ys & (@as(u8, 1) << @intCast(y)) == 0) continue;
+                best = @max(best, self.bonus_table[x][y]);
+            }
+        }
+        return best;
     }
 
     /// A fresh state with room for any query. Use `StateOf(lanesFor(len))` for
@@ -313,18 +352,31 @@ pub const Matcher = struct {
         // Lane j is query[j]; lanes from `n` up are padding and count for nothing.
         const in_query = std.simd.iota(u8, L) < @as(@Vector(L, u8), @splat(@intCast(n)));
         const bits: @Vector(L, u64) = self.query_bits[0..L].*;
-        const present = (bits & @as(@Vector(L, u64), @splat(mask))) != @as(@Vector(L, u64), @splat(0));
+        // All of the byte's bits: its class, and `upper_bit` if it needs one
+        const present = (bits & @as(@Vector(L, u64), @splat(mask))) == bits;
+        const up: usize = @intFromBool(mask & upper_bit != 0);
 
         // The bonus each byte is credited. Right after an exact match of the
-        // previous query byte it is at most `pair_cap`; after a gap, the gap
+        // previous query byte it is at most `pair_own` (`pair_any` if it may
+        // be a typo itself); after a gap, the gap
         // costs at least `gap_open`. After a typo or a dropped byte it can be
         // anything, but then the previous byte was credited at least
         // `typo_penalty` too much, if it could have been exact (`present`).
         const present_s = @select(Score, present, @as(V, @splat(1)), @as(V, @splat(0)));
         const prev_present = shiftUp(L, present_s, 1) == @as(V, @splat(1));
-        const pair: V = self.pair_cap[0..L].*;
+        const pair_any: V = self.pair_any[up][0..L].*;
+        const pair_own: V = self.pair_own[up][0..L].*;
+        const pair = @select(Score, present, pair_own, pair_any);
         const capped = @min(max_bv, @max(pair, max_bv - @as(V, @splat(cfg.gap_open))));
-        const cap = @select(Score, prev_present, capped, max_bv);
+        // Whatever comes before, an exact match of a byte that isn't a letter
+        // or digit earns no bonus of its own: the consecutive bonus at most,
+        // nothing as the first match. Read off `query_bits`, so no table.
+        const no_bonus = (bits & @as(@Vector(L, u64), @splat(alnum_bits))) == @as(@Vector(L, u64), @splat(0));
+        const limited = @select(bool, present, no_bonus, @as(@Vector(L, bool), @splat(false)));
+        const own_limited = @select(bool, @as(@Vector(L, bool), @splat(self.own_class_cap)), limited, @as(@Vector(L, bool), @splat(false)));
+        const consec: V = @splat(cfg.bonus_consecutive);
+        const uncapped = @select(Score, prev_present, capped, max_bv);
+        const cap = @select(Score, own_limited, @min(consec, uncapped), uncapped);
 
         // Dropping a query byte instead is never better with sane penalties,
         // but costs nothing to account for.
@@ -343,12 +395,14 @@ pub const Matcher = struct {
 
         // j is the first match, everything before it dropped
         const j_skip = std.simd.iota(Score, L) * @as(V, @splat(cfg.skip_penalty));
-        const first = match + @as(V, @splat(max_b_first * cfg.first_char_multiplier)) - j_skip + after;
+        const first_bonus = @select(Score, own_limited, zero, max_b_first_v);
+        const first = match + first_bonus * @as(V, @splat(cfg.first_char_multiplier)) - j_skip + after;
         // Or an alignment that is already live at j. The byte after it is the
         // first one fed, after `prev`, which may be a typo the bound didn't
         // credit, so it gets back the full bonus.
         const live = @max(@as(V, state.full.m[0..L].*), @as(V, state.full.g[0..L].*));
-        const uncap = shiftDown(L, @select(Score, in_query, max_b_first_v - cap, zero), 1);
+        const first_fed = @select(Score, own_limited, @min(consec, max_b_first_v), max_b_first_v);
+        const uncap = shiftDown(L, @select(Score, in_query, first_fed - cap, zero), 1);
         const neg: V = @splat(NEG);
         const from_live = @select(Score, live > neg, live + after + uncap, neg);
 
@@ -373,11 +427,9 @@ pub const Matcher = struct {
     /// have classes in `mask`: `maxBonusBelow` without the `prev` part.
     fn maxBonusWithin(self: *const Matcher, mask: u64) Score {
         const cfg = &self.config;
-        const alnum_bits: u64 = (@as(u64, 1) << 36) - 1;
-        const punct_bits: u64 = byteBit('.') | byteBit('_') | byteBit('-') | byteBit(' ') | (~@as(u64, 0) << 41);
         const from_slash: Score = if (mask & byteBit('/') != 0) cfg.bonus_path_boundary else 0;
         const from_punct: Score = if (mask & punct_bits != 0) cfg.bonus_boundary else 0;
-        const from_alnum: Score = if (mask & alnum_bits != 0) cfg.bonus_camel else 0;
+        const from_alnum: Score = if (mask & camel_bits != 0) cfg.bonus_camel else 0;
         return @max(@max(cfg.bonus_consecutive, from_slash), @max(from_punct, from_alnum));
     }
 
@@ -385,13 +437,12 @@ pub const Matcher = struct {
     fn maxBonusBelowReference(self: *const Matcher, prev: u8, mask: u64) Score {
         const cfg = &self.config;
         const prev_class = byte_class[prev];
-        const alnum_bits: u64 = (@as(u64, 1) << 36) - 1;
-        const punct_bits: u64 = byteBit('.') | byteBit('_') | byteBit('-') | byteBit(' ') | (~@as(u64, 0) << 41);
 
         var max_b = cfg.bonus_consecutive;
         if (prev_class == .slash or mask & byteBit('/') != 0) max_b = @max(max_b, cfg.bonus_path_boundary);
         if (prev_class == .punct or mask & punct_bits != 0) max_b = @max(max_b, cfg.bonus_boundary);
-        if (mask & alnum_bits != 0) max_b = @max(max_b, cfg.bonus_camel);
+        // A camel hump ends in an uppercase letter or a digit
+        if (mask & upper_bit != 0 or mask & digit_bits != 0) max_b = @max(max_b, cfg.bonus_camel);
         return max_b;
     }
 
@@ -892,7 +943,8 @@ test "typos: every candidate gets a score, more typos rank lower" {
 }
 
 /// A byte's class, as one bit of a u64: a letter (either case), a digit, one
-/// of `._- /`, or a bucket shared by all other bytes. Fine enough for "can
+/// of `._- /`, or a bucket shared by all other bytes (`labelMask` adds
+/// `upper_bit` for case). Fine enough for "can
 /// this byte occur below here", and a shared bucket only errs on the side of yes.
 pub fn byteBit(c: u8) u64 {
     const l = std.ascii.toLower(c);
@@ -904,27 +956,43 @@ pub fn byteBit(c: u8) u64 {
         '-' => 38,
         ' ' => 39,
         '/' => 40,
-        else => @intCast(41 + l % 23),
+        // Bits 41..62: bit 63 is `upper_bit`
+        else => @intCast(41 + l % 22),
     };
     return @as(u64, 1) << idx;
+}
+
+/// In a mask: some byte is an uppercase ASCII letter (`byteBit` folds case).
+pub const upper_bit: u64 = @as(u64, 1) << 63;
+const alnum_bits: u64 = (@as(u64, 1) << 36) - 1;
+const digit_bits: u64 = alnum_bits & ~((@as(u64, 1) << 26) - 1);
+/// The bits of the bytes that can end a camel hump.
+const camel_bits: u64 = digit_bits | upper_bit;
+/// The shared bucket may hold punctuation, so it counts as some.
+const punct_bits: u64 = byteBit('.') | byteBit('_') | byteBit('-') | byteBit(' ') | ((~@as(u64, 0) << 41) & ~upper_bit);
+const unlimited: Score = std.math.maxInt(Score) / 4;
+
+const all_classes: u8 = (1 << byte_classes) - 1;
+fn classBit(c: ByteClass) u8 {
+    return @as(u8, 1) << @backingInt(c);
 }
 
 /// The byte classes in `s`.
 pub fn labelMask(s: []const u8) u64 {
     var m: u64 = 0;
-    for (s) |c| m |= byteBit(c);
+    for (s) |c| m |= byteBit(c) | if (std.ascii.isUpper(c)) upper_bit else 0;
     return m;
 }
 
 test "subtreeBound never undercuts what feeding the rest can reach" {
     var prng = std.Random.DefaultPrng.init(42);
     const rnd = prng.random();
-    const alphabet = "abcmainzigMAx/._-1";
-    const queries = [_][]const u8{ "a", "ma", "main", "mxin", "zig", "abc/x", "Main", "ii", "xyzzyq", "m.z" };
+    const alphabet = "abcmainzigMAxYBIN/._- 12+\xc3";
+    const queries = [_][]const u8{ "a", "ma", "main", "mxin", "zig", "abc/x", "Main", "ii", "xyzzyq", "m.z", "a-b_c", "x/Y.z", "-ma", ".zig", "M1a", "aB", "1/x", "MAIN", "a.-b" };
 
     for (queries) |q| {
         const m = try Matcher.init(q, .{});
-        for (0..300) |_| {
+        for (0..1000) |_| {
             var buf: [24]u8 = undefined;
             const len = rnd.intRangeAtMost(usize, 1, buf.len);
             for (buf[0..len]) |*c| c.* = alphabet[rnd.uintLessThan(usize, alphabet.len)];
@@ -980,18 +1048,30 @@ test "subtreeBound rules out subtrees missing query bytes, given a threshold" {
     try testing.expect(m.canReach(m.subtreeBound(&state, labelMask("xyz.zig")), null));
 }
 
-test "subtreeBound gives prev's bonus to the first byte fed only" {
-    // After `src/`, only `m` can earn the path-boundary bonus; the rest of
-    // `main` can't follow a `/` or punctuation, nor each other with more
-    // than a camel hump's bonus.
-    const m = try Matcher.init("main", .{});
+/// `subtreeBound` before feeding `rest` after `fed`, minus the score reached.
+fn boundSlack(query: []const u8, fed: []const u8, rest: []const u8) !i32 {
+    const m = try Matcher.init(query, .{});
     var state = m.start();
-    m.feed(&state, "src/");
-    const bound = m.subtreeBound(&state, labelMask("main"));
-    m.feed(&state, "main");
-    const reached: i32 = state.full.done;
-    try testing.expect(bound >= reached);
-    // `a`, `i`, `n` are credited a camel hump (7) but earn the consecutive
-    // bonus (4)
-    try testing.expectEqual(reached + 3 * 3, bound);
+    m.feed(&state, fed);
+    const bound = m.subtreeBound(&state, labelMask(rest));
+    m.feed(&state, rest);
+    try testing.expect(bound >= state.full.done);
+    return bound - state.full.done;
+}
+
+test "subtreeBound is exact on a lowercase filename matched as a whole" {
+    // Only `m` can earn the path-boundary bonus after `src/`. With no
+    // uppercase letter or digit below, the rest can't earn a camel hump.
+    try testing.expectEqual(@as(i32, 0), try boundSlack("main", "src/", "main"));
+    try testing.expectEqual(@as(i32, 0), try boundSlack("main", "src/m", "ain"));
+    // `.` earns no bonus of its own; `b` earns the boundary bonus after it
+    try testing.expectEqual(@as(i32, 0), try boundSlack("a.b", "src/", "a.b"));
+}
+
+test "subtreeBound uses the case of the letters below" {
+    // A camel hump is possible once an uppercase letter is below
+    try testing.expect(try boundSlack("main", "src/", "main") < try boundSlack("main", "src/", "maiN"));
+    // An uppercase byte of a case-sensitive query can't match exactly in an
+    // all-lowercase subtree
+    try testing.expect(try boundSlack("Cargo.toml", "src/", "cargo.toml") < 24);
 }

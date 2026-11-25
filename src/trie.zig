@@ -511,10 +511,18 @@ pub const Trie = struct {
 
         var c = self.at(i).first_child;
         while (c != .none) : (c = self.at(c).next_sibling) {
+            const node = self.at(c);
+            // Siblings are rarely adjacent in memory and the chain can't be
+            // followed ahead, so start the next node's load while this one is
+            // checked (and walked, if it passes)
+            if (node.next_sibling != .none) @prefetch(self.at(node.next_sibling), .{});
+
             // Skip subtrees whose best possible score can't produce a result
-            const bound = matcher.subtreeBound(state, self.at(c).sub);
+            const bound = matcher.subtreeBound(state, node.sub);
             if (!matcher.canReach(bound, top.threshold())) continue;
 
+            // Likewise the first child, which the walk visits after the feed
+            if (node.first_child != .none) @prefetch(self.at(node.first_child), .{});
             const lbl = self.label(c);
             var childState = state.*;
             matcher.feed(&childState, lbl);
