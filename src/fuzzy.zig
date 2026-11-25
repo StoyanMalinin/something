@@ -131,6 +131,15 @@ pub const Matcher = struct {
     fold_table: *const [256]u8,
     /// `bonus_kinds` with this config's values filled in.
     bonus_table: [byte_classes][byte_classes]Score,
+    /// By `prev` byte: the largest bonus the byte after it can earn from `prev`
+    /// alone (a boundary after `/` or punctuation), at least the consecutive
+    /// bonus. For `maxBonusBelow`.
+    prev_bonus: [256]Score,
+    /// Lane j: the largest bonus query[j] can earn when it directly follows
+    /// an exact match of query[j-1], given only query[j-1]'s byte class. At
+    /// least the consecutive bonus. For `subtreeBound`; huge when the config
+    /// makes the cap unsafe (see `init`), which turns it off.
+    pair_cap: [max_query_len]Score,
     config: Config,
 
     pub fn init(query: []const u8, config: Config) error{QueryTooLong}!Matcher {
@@ -144,7 +153,14 @@ pub const Matcher = struct {
             .case_sensitive = false,
             .fold_table = &lowercase_table,
             .bonus_table = undefined,
+            .prev_bonus = undefined,
+            .pair_cap = @splat(std.math.maxInt(Score) / 4),
             .config = config,
+        };
+        for (&self.prev_bonus, 0..) |*b, c| b.* = switch (byte_class[c]) {
+            .slash => @max(config.bonus_consecutive, config.bonus_path_boundary),
+            .punct => @max(config.bonus_consecutive, config.bonus_boundary),
+            .lower, .upper, .digit, .other => config.bonus_consecutive,
         };
         for (query) |c| {
             if (std.ascii.isUpper(c)) {
@@ -164,6 +180,27 @@ pub const Matcher = struct {
         for (query, 0..) |c, i| {
             self.query[i] = self.fold(c);
             self.query_bits[i] = byteBit(self.query[i]);
+        }
+
+        // The cap moves bonus a byte can earn after a typo or a dropped query
+        // byte onto that byte's own overcredit in the bound (`typo_penalty`,
+        // or a match plus `skip_penalty`), so those must cover any bonus.
+        const max_bonus = @max(@max(config.bonus_path_boundary, config.bonus_boundary), @max(config.bonus_camel, config.bonus_consecutive));
+        const caps_safe = config.gap_open >= 0 and
+            config.typo_penalty >= max_bonus and config.score_match + config.skip_penalty >= max_bonus;
+        if (caps_safe and query.len > 1) {
+            for (1..query.len) |j| {
+                const q = self.query[j - 1];
+                const cls = byte_class[q];
+                // A folded lowercase letter may stand for an uppercase one
+                const alt: ByteClass = if (!self.case_sensitive and cls == .lower) .upper else cls;
+                var best: Score = config.bonus_consecutive;
+                for (0..byte_classes) |y| {
+                    best = @max(best, self.bonus_table[@backingInt(cls)][y]);
+                    best = @max(best, self.bonus_table[@backingInt(alt)][y]);
+                }
+                self.pair_cap[j] = best;
+            }
         }
         return self;
     }
@@ -255,9 +292,9 @@ pub const Matcher = struct {
     /// Upper bound on the `full.done` reachable by feeding more bytes, all
     /// with byte classes in `mask` (see `byteBit`). It also bounds the segment
     /// rows, whose alignments are a subset. Assumes every remaining query byte
-    /// gets the best case: an exact match with the largest bonus if its class
-    /// is in the mask, otherwise a typo with the largest bonus. Starting over
-    /// at any query byte, dropping the ones before it, is covered too.
+    /// gets the best case: an exact match if its class is in the mask,
+    /// otherwise a typo, with the largest bonus it can earn there. Starting
+    /// over at any query byte, dropping the ones before it, is covered too.
     pub fn subtreeBound(self: *const Matcher, state: anytype, mask: u64) i32 {
         const n = self.len;
         if (n == 0) return 0;
@@ -265,23 +302,40 @@ pub const Matcher = struct {
         std.debug.assert(n <= L);
         const V = @Vector(L, Score);
         const cfg = &self.config;
-        const max_b = self.maxBonusBelow(state.prev, mask);
+        // Only the first byte fed follows `prev`; every later one follows a
+        // byte of the subtree, whose class is in the mask
+        const max_b_first = self.maxBonusBelow(state.prev, mask);
+        const max_b = self.maxBonusWithin(mask);
+        const max_bv: V = @splat(max_b);
+        const max_b_first_v: V = @splat(max_b_first);
         const exact: Score = cfg.score_match;
-        // Dropping a query byte instead is never better with sane penalties,
-        // but costs nothing to account for.
-        const typo: Score = @intCast(@max(@as(i32, exact) - cfg.typo_penalty, -@as(i32, cfg.skip_penalty) - max_b));
 
         // Lane j is query[j]; lanes from `n` up are padding and count for nothing.
         const in_query = std.simd.iota(u8, L) < @as(@Vector(L, u8), @splat(@intCast(n)));
         const bits: @Vector(L, u64) = self.query_bits[0..L].*;
         const present = (bits & @as(@Vector(L, u64), @splat(mask))) != @as(@Vector(L, u64), @splat(0));
-        const match = @select(Score, present, @as(V, @splat(exact)), @as(V, @splat(typo)));
+
+        // The bonus each byte is credited. Right after an exact match of the
+        // previous query byte it is at most `pair_cap`; after a gap, the gap
+        // costs at least `gap_open`. After a typo or a dropped byte it can be
+        // anything, but then the previous byte was credited at least
+        // `typo_penalty` too much, if it could have been exact (`present`).
+        const present_s = @select(Score, present, @as(V, @splat(1)), @as(V, @splat(0)));
+        const prev_present = shiftUp(L, present_s, 1) == @as(V, @splat(1));
+        const pair: V = self.pair_cap[0..L].*;
+        const capped = @min(max_bv, @max(pair, max_bv - @as(V, @splat(cfg.gap_open))));
+        const cap = @select(Score, prev_present, capped, max_bv);
+
+        // Dropping a query byte instead is never better with sane penalties,
+        // but costs nothing to account for.
+        const typo = @max(@as(V, @splat(exact - cfg.typo_penalty)), @as(V, @splat(-cfg.skip_penalty)) - cap);
+        const match = @select(Score, present, @as(V, @splat(exact)), typo);
 
         // The best case of each query byte, and the exclusive suffix sum of it:
         // `after[j]` is the best case for the query bytes after j. The sum is a
         // log2(L)-round scan, shifting lanes down and adding.
         const zero: V = @splat(0);
-        const per_byte = @select(Score, in_query, match + @as(V, @splat(max_b)), zero);
+        const per_byte = @select(Score, in_query, match + cap, zero);
         var inclusive = per_byte;
         comptime var k: usize = 1;
         inline while (k < L) : (k *= 2) inclusive += shiftDown(L, inclusive, k);
@@ -289,11 +343,14 @@ pub const Matcher = struct {
 
         // j is the first match, everything before it dropped
         const j_skip = std.simd.iota(Score, L) * @as(V, @splat(cfg.skip_penalty));
-        const first = match + @as(V, @splat(max_b * cfg.first_char_multiplier)) - j_skip + after;
-        // Or an alignment that is already live at j
+        const first = match + @as(V, @splat(max_b_first * cfg.first_char_multiplier)) - j_skip + after;
+        // Or an alignment that is already live at j. The byte after it is the
+        // first one fed, after `prev`, which may be a typo the bound didn't
+        // credit, so it gets back the full bonus.
         const live = @max(@as(V, state.full.m[0..L].*), @as(V, state.full.g[0..L].*));
+        const uncap = shiftDown(L, @select(Score, in_query, max_b_first_v - cap, zero), 1);
         const neg: V = @splat(NEG);
-        const from_live = @select(Score, live > neg, live + after, neg);
+        const from_live = @select(Score, live > neg, live + after + uncap, neg);
 
         const best = @select(Score, in_query, @max(first, from_live), @as(V, @splat(std.math.minInt(Score))));
         return @max(@as(i32, state.full.done), @as(i32, @reduce(.Max, best)));
@@ -307,6 +364,25 @@ pub const Matcher = struct {
     /// may hold punctuation, so it counts as one. The consecutive bonus needs
     /// nothing.
     fn maxBonusBelow(self: *const Matcher, prev: u8, mask: u64) Score {
+        // Branch-free: this runs once per child visited. The `prev` part is a
+        // table (`prev_bonus`), the mask part three selects.
+        return @max(self.prev_bonus[prev], self.maxBonusWithin(mask));
+    }
+
+    /// The largest bonus a byte can earn when it and the byte before it both
+    /// have classes in `mask`: `maxBonusBelow` without the `prev` part.
+    fn maxBonusWithin(self: *const Matcher, mask: u64) Score {
+        const cfg = &self.config;
+        const alnum_bits: u64 = (@as(u64, 1) << 36) - 1;
+        const punct_bits: u64 = byteBit('.') | byteBit('_') | byteBit('-') | byteBit(' ') | (~@as(u64, 0) << 41);
+        const from_slash: Score = if (mask & byteBit('/') != 0) cfg.bonus_path_boundary else 0;
+        const from_punct: Score = if (mask & punct_bits != 0) cfg.bonus_boundary else 0;
+        const from_alnum: Score = if (mask & alnum_bits != 0) cfg.bonus_camel else 0;
+        return @max(@max(cfg.bonus_consecutive, from_slash), @max(from_punct, from_alnum));
+    }
+
+    /// `maxBonusBelow` written out as rules, for the test.
+    fn maxBonusBelowReference(self: *const Matcher, prev: u8, mask: u64) Score {
         const cfg = &self.config;
         const prev_class = byte_class[prev];
         const alnum_bits: u64 = (@as(u64, 1) << 36) - 1;
@@ -869,6 +945,23 @@ test "subtreeBound never undercuts what feeding the rest can reach" {
     }
 }
 
+test "maxBonusBelow matches its rules for every prev byte" {
+    var prng = std.Random.DefaultPrng.init(3);
+    const rnd = prng.random();
+    const m = try Matcher.init("a", .{});
+    for (0..256) |prev| {
+        for (0..200) |_| {
+            // Sparse masks, so each class's bits are hit and missed
+            const mask = rnd.int(u64) & rnd.int(u64) & rnd.int(u64);
+            try testing.expectEqual(
+                m.maxBonusBelowReference(@intCast(prev), mask),
+                m.maxBonusBelow(@intCast(prev), mask),
+            );
+        }
+        try testing.expectEqual(m.maxBonusBelowReference(@intCast(prev), 0), m.maxBonusBelow(@intCast(prev), 0));
+    }
+}
+
 test "subtreeBound is tighter when the subtree can't hold a word boundary" {
     const m = try Matcher.init("main", .{});
     var state = m.start();
@@ -885,4 +978,20 @@ test "subtreeBound rules out subtrees missing query bytes, given a threshold" {
     try testing.expect(!m.canReach(m.subtreeBound(&state, labelMask("xyz.zig")), t));
     try testing.expect(m.canReach(m.subtreeBound(&state, labelMask("in.zig")), t));
     try testing.expect(m.canReach(m.subtreeBound(&state, labelMask("xyz.zig")), null));
+}
+
+test "subtreeBound gives prev's bonus to the first byte fed only" {
+    // After `src/`, only `m` can earn the path-boundary bonus; the rest of
+    // `main` can't follow a `/` or punctuation, nor each other with more
+    // than a camel hump's bonus.
+    const m = try Matcher.init("main", .{});
+    var state = m.start();
+    m.feed(&state, "src/");
+    const bound = m.subtreeBound(&state, labelMask("main"));
+    m.feed(&state, "main");
+    const reached: i32 = state.full.done;
+    try testing.expect(bound >= reached);
+    // `a`, `i`, `n` are credited a camel hump (7) but earn the consecutive
+    // bonus (4)
+    try testing.expectEqual(reached + 3 * 3, bound);
 }
