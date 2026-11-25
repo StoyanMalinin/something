@@ -53,9 +53,10 @@ pub const FileIndex = struct {
     /// Adding below a position other than the root leaves the search masks
     /// above that position stale: call `refreshMasks` once done (see `trie.Trie.sub`).
     ///
-    /// `position` must be the root or a folder's. A folder's position stays
-    /// valid until it is removed; a file's can change when a later name
-    /// extends it ("foo", then "foo.bak"; see `trie.Trie.add`).
+    /// `position` must be the root or a folder's. Returns the folder's
+    /// position, valid until it is removed. Files have none: most are packed
+    /// into their folder's leaves (see `trie.Trie.add`), so a file gives
+    /// `.none` or a node it has no use for.
     pub fn addFileName(self: *FileIndex, position: Position, name: []const u8, isDir: bool) !Position {
         var buf: KeyBuf = undefined;
         const key = try entryKey(name, isDir, &buf);
@@ -126,7 +127,7 @@ pub const FileIndex = struct {
             return true;
         }
 
-        return self.trie.removeSingle(position, key) != null;
+        return self.trie.removeSingle(position, key);
     }
 
     pub fn moveOrdinaryFile(
@@ -144,7 +145,7 @@ pub const FileIndex = struct {
         self.mut.lockUncancelable(self.io);
         defer self.mut.unlock(self.io);
 
-        if (self.trie.removeSingle(fromPosition, fromKey) == null) {
+        if (!self.trie.removeSingle(fromPosition, fromKey)) {
             return false;
         }
 
@@ -201,10 +202,9 @@ test "siblings that share a prefix do not collide" {
     // /r/, /r/foo/, /r/foo/bar and /r/foobar
     const root = try index.addFileName(index.rootPosition(), "/r", true);
     const foo = try index.addFileName(root, "foo", true);
-    const fooBar = try index.addFileName(foo, "bar", false);
-    const foobar = try index.addFileName(root, "foobar", false);
+    _ = try index.addFileName(foo, "bar", false);
+    _ = try index.addFileName(root, "foobar", false);
 
-    try std.testing.expect(fooBar != foobar);
     try std.testing.expectEqual(1, try index.query("foobar"));
     try std.testing.expectEqual(1, try index.query("foo/bar"));
 }
@@ -299,7 +299,7 @@ test "moving a folder" {
     const root = try index.addFileName(index.rootPosition(), "/r", true);
     const a = try index.addFileName(root, "a", true);
     const b = try index.addFileName(a, "b", true);
-    const f = try index.addFileName(b, "f.txt", false);
+    _ = try index.addFileName(b, "f.txt", false);
     _ = try index.addFileName(root, "a.txt", false);
     const d = try index.addFileName(root, "d", true);
 
@@ -310,7 +310,8 @@ test "moving a folder" {
     try std.testing.expectEqual(1, try index.query("a.txt"));
     try std.testing.expectEqual(6, index.trie.countFinalNodes());
     // Positions below the moved folder are still the same nodes
-    try std.testing.expect(index.trie.isFinal(b) and index.trie.isFinal(f));
+    try std.testing.expect(index.trie.isFinal(b));
+    try std.testing.expectEqual(1, try index.query("b/f.txt"));
 
     // A rename inside the same folder
     try std.testing.expectEqual(true, try index.moveFolder(root, "d", root, "e"));
