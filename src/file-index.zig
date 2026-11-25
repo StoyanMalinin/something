@@ -1,5 +1,6 @@
 const std = @import("std");
 const trie = @import("trie.zig");
+const vanilla = @import("vanilla-trie.zig");
 const fuzzy = @import("fuzzy.zig");
 
 pub const Position = trie.Index;
@@ -26,6 +27,9 @@ pub const FileIndex = struct {
     io: std.Io,
     mut: std.Io.Mutex,
     trie: trie.Trie,
+    limits: trie.Limits,
+    /// While building in bulk (`beginBulk`), adds go here instead of `trie`.
+    bulk: ?vanilla.Trie = null,
     allocator: std.mem.Allocator,
 
     pub fn rootPosition(_: *FileIndex) Position {
@@ -33,8 +37,34 @@ pub const FileIndex = struct {
     }
 
     pub fn deinit(self: *FileIndex) void {
+        if (self.bulk) |*b| b.deinit();
         self.trie.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Starts building in bulk: adds go to a plain trie whose positions never
+    /// move, so walker threads can hold them across adds, until `endBulk`
+    /// packs it into the search trie. The index must be empty. Only adds (and
+    /// `refreshMasks`, which does nothing until then) are allowed in between.
+    pub fn beginBulk(self: *FileIndex) !void {
+        std.debug.assert(self.bulk == null and self.trie.countFinalNodes() == 0);
+        // Straight from the OS, so freeing it in `endBulk` gives the pages
+        // back: malloc may keep large freed blocks cached
+        self.bulk = try vanilla.Trie.init(std.heap.page_allocator);
+    }
+
+    /// Packs what was added since `beginBulk` into the search trie, with
+    /// every search mask computed. Positions from the bulk phase are void.
+    pub fn endBulk(self: *FileIndex) !void {
+        self.mut.lockUncancelable(self.io);
+        defer self.mut.unlock(self.io);
+
+        var b = self.bulk.?;
+        const packed_trie = try trie.Trie.fromVanilla(self.allocator, self.limits, &b);
+        self.trie.deinit();
+        self.trie = packed_trie;
+        b.deinit();
+        self.bulk = null;
     }
 
     fn entryKey(name: []const u8, isDir: bool, buf: *KeyBuf) ![]const u8 {
@@ -53,10 +83,10 @@ pub const FileIndex = struct {
     /// Adding below a position other than the root leaves the search masks
     /// above that position stale: call `refreshMasks` once done (see `trie.Trie.sub`).
     ///
-    /// `position` must be the root or a folder's. Returns the folder's
-    /// position, valid until it is removed. Files have none: most are packed
-    /// into their folder's leaves (see `trie.Trie.add`), so a file gives
-    /// `.none` or a node it has no use for.
+    /// `position` must be the root or a folder's. Returns a folder's
+    /// position. In bulk it stays valid; otherwise only until the folder's
+    /// parent changes (adding below the folder is fine; see `trie.Trie`).
+    /// Files have no use for theirs.
     pub fn addFileName(self: *FileIndex, position: Position, name: []const u8, isDir: bool) !Position {
         var buf: KeyBuf = undefined;
         const key = try entryKey(name, isDir, &buf);
@@ -64,6 +94,10 @@ pub const FileIndex = struct {
         self.mut.lockUncancelable(self.io);
         defer self.mut.unlock(self.io);
 
+        if (self.bulk) |*b| {
+            const at = try b.add(@enumFromInt(@intFromEnum(position)), key);
+            return @enumFromInt(@intFromEnum(at));
+        }
         return self.trie.add(position, key);
     }
 
@@ -76,6 +110,8 @@ pub const FileIndex = struct {
         self.mut.lockUncancelable(self.io);
         defer self.mut.unlock(self.io);
 
+        // In bulk, `endBulk` computes every mask
+        if (self.bulk != null) return;
         self.trie.refreshMasks(.root, key, position);
     }
 
@@ -123,7 +159,7 @@ pub const FileIndex = struct {
         if (isDir) {
             std.debug.assert(std.mem.endsWith(u8, key, "/"));
             const removed = self.trie.removeRecursive(position, key) orelse return false;
-            self.trie.freeSubtree(removed);
+            self.trie.freeDetached(removed);
             return true;
         }
 
@@ -168,16 +204,8 @@ pub const FileIndex = struct {
         self.mut.lockUncancelable(self.io);
         defer self.mut.unlock(self.io);
 
-        const old = self.trie.removeRecursive(fromPosition, fromKey) orelse return false;
-        errdefer self.trie.freeSubtree(old);
-        const moved = try self.trie.add(toPosition, toKey);
-
         // An existing folder at the destination is replaced
-        const below = self.trie.adoptChildren(moved, old);
-        self.trie.freeEmptied(old);
-        // The adopted children's byte classes, for the folders above
-        self.trie.widenAlong(toPosition, toKey, below);
-        return true;
+        return self.trie.moveFolder(fromPosition, fromKey, toPosition, toKey);
     }
 };
 
@@ -187,6 +215,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, limits: trie.Limits) !*Fil
     errdefer allocator.destroy(t);
     t.* = FileIndex{
         .trie = try trie.Trie.init(allocator, limits),
+        .limits = limits,
         .io = io,
         .mut = .init,
         .allocator = allocator,

@@ -103,10 +103,17 @@ pub fn createIndex(path: []const u8) !void {
 
     const startTime = std.Io.Clock.awake.now(io);
     walk.index = index;
+    // The walk adds into a plain trie, packed into the search trie once done
+    try index.beginBulk();
     const cnt = try walk.walk(path);
+    const walkedTime = std.Io.Clock.awake.now(io);
+    try index.endBulk();
     const endTime = std.Io.Clock.awake.now(io);
 
-    std.debug.print("Indexing took {d}ms\n", .{startTime.durationTo(endTime).toMilliseconds()});
+    std.debug.print("Indexing took {d}ms (packing {d}ms)\n", .{
+        startTime.durationTo(endTime).toMilliseconds(),
+        walkedTime.durationTo(endTime).toMilliseconds(),
+    });
     std.debug.print("Total files: {d}\n", .{cnt});
 }
 
