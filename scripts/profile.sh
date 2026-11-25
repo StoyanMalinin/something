@@ -2,11 +2,12 @@
 # Profile the fuzzy search over /opt/homebrew with Instruments' Time Profiler
 # (xctrace) and open the query-phase flame graph in speedscope, in Chrome.
 #
-#   scripts/profile.sh <query> [runs=5]
+#   scripts/profile.sh [query|@file] [runs]
 #
-# Needs full Xcode (xcrun xctrace). With few runs the one-time index scan dominates the
-# trace; the opened profile is filtered to stacks through queryLoop / FileIndex.search, so
-# only the queries are shown. Use more runs (e.g. 200) for steadier numbers.
+# With no query, profiles the varied set in scripts/queries.txt (@file for another set),
+# runs=20 passes over it; a single query defaults to runs=200. Needs full Xcode (xcrun
+# xctrace). The opened profile is filtered to stacks through queryLoop / FileIndex.search,
+# so only the queries are shown, not the one-time index scan.
 #
 # Env:
 #   ROOT=<dir>   folder to scan (default: /opt/homebrew, ~150k files, no macOS privacy prompts)
@@ -16,18 +17,18 @@
 #   FOCUS=<re>   stacks to keep in the opened profile (default: queryLoop|FileIndex\.search)
 set -euo pipefail
 
-if [[ $# -lt 1 || -z "${1// }" ]]; then
-  echo "usage: $0 <query> [runs=5]" >&2
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+QUERY="${1:-@$here/queries.txt}"
+if [[ -z "${QUERY// }" ]]; then
+  echo "usage: $0 [query|@file] [runs]" >&2
   exit 2
 fi
-QUERY="$1"
-RUNS="${2:-5}"
+if [[ "$QUERY" == @* ]]; then RUNS="${2:-20}"; else RUNS="${2:-200}"; fi
 ROOT="${ROOT:-/opt/homebrew}"
 BROWSER_APP="${BROWSER_APP:-Google Chrome}"
 FOCUS="${FOCUS:-queryLoop|FileIndex\\.search}"
 SPEEDSCOPE_VERSION="1.25.0"
 
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
 OUT="${OUT:-$repo/traces}"
 # Dedicated install prefix: zig-out/bin is shared with plain `zig build` (Debug), editor
@@ -66,10 +67,12 @@ if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   codesign --force --sign "$CODESIGN_IDENTITY" "$bin"
 fi
 
-# The app reads queries from stdin: RUNS copies of the query, then quit.
-# One process = one index build, so all runs hit the same warm index.
+# The app reads queries from stdin: RUNS copies of the query (or of the query file), then
+# quit. One process = one index build, so all runs hit the same warm index.
 {
-  for ((i = 0; i < RUNS; i++)); do printf '%s\n' "$QUERY"; done
+  for ((i = 0; i < RUNS; i++)); do
+    if [[ "$QUERY" == @* ]]; then grep -v '^[[:space:]]*$' "${QUERY#@}"; else printf '%s\n' "$QUERY"; fi
+  done
   printf ':q\n'
 } >"$queries"
 

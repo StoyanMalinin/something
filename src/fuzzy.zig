@@ -977,11 +977,28 @@ fn classBit(c: ByteClass) u8 {
     return @as(u8, 1) << @backingInt(c);
 }
 
-/// The byte classes in `s`.
+/// Every byte's `byteBit`, with `upper_bit` for an uppercase letter.
+const label_bits: [256]u64 = blk: {
+    @setEvalBranchQuota(10_000);
+    var t: [256]u64 = undefined;
+    for (&t, 0..) |*b, c| b.* = byteBit(c) | if (std.ascii.isUpper(c)) upper_bit else 0;
+    break :blk t;
+};
+
+/// The byte classes in `s`. The search builds this for every leaf it passes,
+/// so it is one table load per byte.
 pub fn labelMask(s: []const u8) u64 {
     var m: u64 = 0;
-    for (s) |c| m |= byteBit(c) | if (std.ascii.isUpper(c)) upper_bit else 0;
+    for (s) |c| m |= label_bits[c];
     return m;
+}
+
+test "labelMask's table matches byteBit" {
+    for (0..256) |c| {
+        const b: u8 = @intCast(c);
+        const want = byteBit(b) | if (std.ascii.isUpper(b)) upper_bit else 0;
+        try testing.expectEqual(want, labelMask(&.{b}));
+    }
 }
 
 test "subtreeBound never undercuts what feeding the rest can reach" {

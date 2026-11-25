@@ -85,7 +85,9 @@ fn queryLoop() !void {
         const searchResult = try index.search(gpa, word, .{ .limit = 10 });
         const endTime = std.Io.Clock.awake.now(io);
 
-        std.debug.print("{d} matches in {d}ms\n", .{ searchResult.len, startTime.durationTo(endTime).toMilliseconds() });
+        // Microsecond resolution: many queries take a few milliseconds (scripts/bench.sh reads this)
+        const micros: u64 = @intCast(startTime.durationTo(endTime).toMicroseconds());
+        std.debug.print("{d} matches in {d}.{d:0>3}ms\n", .{ searchResult.len, micros / 1000, micros % 1000 });
         for (searchResult) |result| {
             std.debug.print("{d} {s}\n", .{ result.score, result.path });
         }
