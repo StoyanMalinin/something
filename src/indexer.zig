@@ -11,9 +11,9 @@ var gpa: std.mem.Allocator = undefined;
 var io: std.Io = undefined;
 
 fn scanFolder(path: []const u8, position: fileIndex.Position) !void {
-    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
-        // Gone again, replaced by a file, or not ours to read
-        error.FileNotFound, error.NotDir, error.AccessDenied => return,
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+        // Gone again, replaced by a file or a link, or not ours to read
+        error.FileNotFound, error.NotDir, error.SymLinkLoop, error.AccessDenied => return,
         else => return err,
     };
     defer dir.close(io);

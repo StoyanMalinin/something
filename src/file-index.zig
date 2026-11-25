@@ -128,7 +128,7 @@ pub const FileIndex = struct {
         text: []const u8,
         options: SearchOptions,
     ) ![]SearchResult {
-        const matcher = try fuzzy.Matcher.init(text, .{});
+        const matcher = try fuzzy.Matcher.init(queryTail(text), .{});
 
         const buf = try allocator.alloc(fuzzy.TopK([]u8).Entry, options.limit);
         defer allocator.free(buf);
@@ -147,6 +147,17 @@ pub const FileIndex = struct {
             r.* = .{ .score = e.score, .path = e.item };
         }
         return results;
+    }
+
+    /// The matcher takes at most `fuzzy.max_query_len` bytes. A longer query (a pasted full
+    /// path, say) is cut down to its end: every path that matches the whole query matches
+    /// its tail too, and the tail holds the file name, which earns most of the score. The
+    /// cut never starts inside a UTF-8 sequence.
+    fn queryTail(text: []const u8) []const u8 {
+        if (text.len <= fuzzy.max_query_len) return text;
+        var start = text.len - fuzzy.max_query_len;
+        while (start < text.len and text[start] & 0xC0 == 0x80) start += 1;
+        return text[start..];
     }
 
     pub fn removeFileName(self: *FileIndex, position: Position, name: []const u8, isDir: bool) !bool {
@@ -482,6 +493,32 @@ test "fuzzy search over the trie matches scoring each path on its own" {
             try std.testing.expectEqual(expected[i], r.score);
         }
     }
+}
+
+test "a query longer than the matcher takes still finds the full path" {
+    const allocator = std.testing.allocator;
+    const index = try init(allocator, std.testing.io, trie.test_limits);
+    defer index.deinit();
+    try buildSearchFixture(index);
+
+    const root = try index.addFileName(index.rootPosition(), "/System", true);
+    var pos = root;
+    for ([_][]const u8{ "Library", "PrivateFrameworks", "AvatarKitContent.framework", "Versions", "A", "Resources", "memoji", "assets", "outfit", "outfit_cheongsamQipao.aa" }) |d| {
+        pos = try index.addFileName(pos, d, true);
+    }
+    _ = try index.addFileName(pos, "outfit_cheongsamQipao_body_outfitDefaultSlack25.wrapdata", false);
+    try index.refreshMasks(root, "/System");
+
+    const full = "/System/Library/PrivateFrameworks/AvatarKitContent.framework/Versions/A/Resources/memoji/assets/outfit/outfit_cheongsamQipao.aa/outfit_cheongsamQipao_body_outfitDefaultSlack25.wrapdata";
+    try std.testing.expect(full.len > fuzzy.max_query_len);
+    const results = try index.search(allocator, full, .{ .limit = 3 });
+    defer freeSearchResults(allocator, results);
+    try std.testing.expect(results.len >= 1);
+    try std.testing.expectEqualStrings(full, results[0].path);
+
+    // A cut that would land inside a multi-byte character moves past it
+    const accented = "é" ++ @as([fuzzy.max_query_len - 1]u8, @splat('a'));
+    try std.testing.expectEqual(fuzzy.max_query_len - 1, FileIndex.queryTail(accented).len);
 }
 
 test "a directory comes before its own contents when the query names it" {

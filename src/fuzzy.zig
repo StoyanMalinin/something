@@ -64,7 +64,12 @@ pub const Config = struct {
     /// on top of the match reward it gives up.
     typo_penalty: Score = 24,
     /// Charged per query byte that is dropped because no candidate byte matches it.
-    skip_penalty: Score = 24,
+    /// A dropped byte also gives up the match reward and bonus a typo keeps, so this
+    /// is set for a drop to cost about what a typo does (score_match + bonus +
+    /// skip_penalty ~ typo_penalty): both are one edit. At 24, an extra letter in
+    /// the query ("memorization" for Memoization) cost nearly two typos, and paths
+    /// that strung a typo through word boundaries ranked above the real match.
+    skip_penalty: Score = 8,
 };
 
 /// Matching progress is two DP rows. `m[j]`: best alignment of query[0..=j]
@@ -1215,4 +1220,14 @@ test "subtreeBound uses the case of the letters below" {
     // An uppercase byte of a case-sensitive query can't match exactly in an
     // all-lowercase subtree
     try testing.expect(try boundSlack("Cargo.toml", "src/", "cargo.toml") < 24);
+}
+
+
+test "an extra letter in the query costs about what a typo does" {
+    // "memorization" is Memoization with one extra letter; the other path only
+    // gets there through a typo and a run of word-boundary bonuses
+    const m = try Matcher.init("memorization", .{});
+    const real = m.score("/p/Theme5_DP/Memoization/").?;
+    const noise = m.score("/p/Uchebna programa_Mag_eBeG_Organizational Behaviour.pdf").?;
+    try testing.expect(real > noise);
 }

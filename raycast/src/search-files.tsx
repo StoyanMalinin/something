@@ -50,6 +50,10 @@ function query(socketPath: string, limit: number, text: string, signal: AbortSig
   });
 }
 
+function formatLatency(ms: number): string {
+  return `${ms < 10 ? ms.toFixed(1) : Math.round(ms)} ms`;
+}
+
 function describe(error: unknown): string {
   const code = (error as NodeJS.ErrnoException)?.code;
   if (code === "ENOENT" || code === "ECONNREFUSED") {
@@ -67,18 +71,23 @@ export default function Command() {
   const [matches, setMatches] = useState<Match[]>([]);
   const [error, setError] = useState<string>();
   const [isLoading, setIsLoading] = useState(false);
+  // Round trip of the query on screen: connect, search, and every result read back
+  const [latencyMs, setLatencyMs] = useState<number>();
 
   useEffect(() => {
     if (text.trim() === "") {
       setMatches([]);
       setError(undefined);
+      setLatencyMs(undefined);
       return;
     }
     // A newer keystroke cancels the query still in flight
     const controller = new AbortController();
     setIsLoading(true);
+    const start = performance.now();
     query(socketPath, limit, text, controller.signal)
       .then((m) => {
+        setLatencyMs(performance.now() - start);
         setMatches(m);
         setError(undefined);
       })
@@ -102,8 +111,17 @@ export default function Command() {
         <List.EmptyView icon={Icon.ExclamationMark} title="Can't reach something-daemon" description={error} />
       ) : text.trim() === "" ? (
         <List.EmptyView icon={Icon.MagnifyingGlass} title="Type to search every indexed file" />
+      ) : matches.length === 0 && latencyMs !== undefined ? (
+        <List.EmptyView icon={Icon.MagnifyingGlass} title="No matches" description={formatLatency(latencyMs)} />
       ) : (
-        matches.map((m) => <MatchItem key={m.path} match={m} />)
+        <List.Section
+          title={`${matches.length} ${matches.length === 1 ? "match" : "matches"}`}
+          subtitle={latencyMs === undefined ? undefined : formatLatency(latencyMs)}
+        >
+          {matches.map((m) => (
+            <MatchItem key={m.path} match={m} />
+          ))}
+        </List.Section>
       )}
     </List>
   );

@@ -5,10 +5,26 @@ pub var index: *fileIndex.FileIndex = undefined;
 pub var gpa: std.mem.Allocator = undefined;
 pub var io: std.Io = undefined;
 
+/// macOS firmlinks `/Users`, `/Applications`, `/Library`, ... from the data volume
+/// mounted at `/System/Volumes/Data`. Firmlinks read as plain folders, so walking `/`
+/// would index all of those twice. Set by `walk` when that folder exists.
+var dataVolumeInode: ?std.Io.File.INode = null;
+
+/// Whether to leave out the folder `name` inside `dir`. Only stats folders named "Data",
+/// so the check is free for everything else.
+fn skipDir(dir: std.Io.Dir, name: []const u8) bool {
+    const inode = dataVolumeInode orelse return false;
+    if (!std.mem.eql(u8, name, "Data")) return false;
+    const st = dir.statFile(io, name, .{ .follow_symlinks = false }) catch return false;
+    return st.inode == inode;
+}
+
 pub fn walkSingleThreaded(dir: *std.Io.Dir, position: fileIndex.Position) !i32 {
     var cnt: i32 = 0;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
+        if (entry.kind == std.Io.File.Kind.directory and skipDir(dir.*, entry.name)) continue;
+
         const subPosition = try index.addFileName(position, entry.name, entry.kind == std.Io.File.Kind.directory);
 
         if (entry.kind == std.Io.File.Kind.directory) {
@@ -68,6 +84,8 @@ pub fn walk(path: []const u8) !i32 {
     ).initContext({});
     defer pq.deinit(gpa);
 
+    dataVolumeInode = if (std.Io.Dir.cwd().statFile(io, "/System/Volumes/Data", .{ .follow_symlinks = false })) |st| st.inode else |_| null;
+
     const dir = try gpa.create(?std.Io.Dir);
     dir.* = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
 
@@ -89,11 +107,13 @@ pub fn walk(path: []const u8) !i32 {
 
         var it = item.dir.*.?.iterate();
         while (try it.next(io)) |entry| {
+            if (entry.kind == std.Io.File.Kind.directory and skipDir(item.dir.*.?, entry.name)) continue;
+
             const subPosition = try index.addFileName(position, entry.name, entry.kind == std.Io.File.Kind.directory);
 
             if (entry.kind == std.Io.File.Kind.directory) {
                 const subDir = try gpa.create(?std.Io.Dir);
-                subDir.* = item.dir.*.?.openDir(io, entry.name, .{ .iterate = true }) catch |err|
+                subDir.* = item.dir.*.?.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false }) catch |err|
                     switch (err) {
                         error.PermissionDenied => null,
                         else => |leftoverErr| return leftoverErr,
