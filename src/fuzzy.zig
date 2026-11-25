@@ -261,26 +261,62 @@ pub const Matcher = struct {
     pub fn subtreeBound(self: *const Matcher, state: anytype, mask: u64) i32 {
         const n = self.len;
         if (n == 0) return 0;
+        const L = @TypeOf(state.full).lanes;
+        std.debug.assert(n <= L);
+        const V = @Vector(L, Score);
         const cfg = &self.config;
-        const max_b: i32 = @max(@max(cfg.bonus_path_boundary, cfg.bonus_boundary), @max(cfg.bonus_camel, cfg.bonus_consecutive));
-        const exact: i32 = cfg.score_match;
+        const max_b = self.maxBonusBelow(state.prev, mask);
+        const exact: Score = cfg.score_match;
         // Dropping a query byte instead is never better with sane penalties,
         // but costs nothing to account for.
-        const typo: i32 = @max(exact - cfg.typo_penalty, -@as(i32, cfg.skip_penalty) - max_b);
+        const typo: Score = @intCast(@max(@as(i32, exact) - cfg.typo_penalty, -@as(i32, cfg.skip_penalty) - max_b));
 
-        var best: i32 = state.full.done;
-        var suffix: i32 = 0; // best case for the query bytes after j
-        var j: usize = n;
-        while (j > 0) {
-            j -= 1;
-            const match: i32 = if (mask & self.query_bits[j] != 0) exact else typo;
-            const live = @max(state.full.m[j], state.full.g[j]);
-            if (live > NEG) best = @max(best, live + suffix);
-            const first = match + max_b * cfg.first_char_multiplier - @as(i32, @intCast(j)) * cfg.skip_penalty;
-            best = @max(best, first + suffix);
-            suffix += match + max_b;
-        }
-        return best;
+        // Lane j is query[j]; lanes from `n` up are padding and count for nothing.
+        const in_query = std.simd.iota(u8, L) < @as(@Vector(L, u8), @splat(@intCast(n)));
+        const bits: @Vector(L, u64) = self.query_bits[0..L].*;
+        const present = (bits & @as(@Vector(L, u64), @splat(mask))) != @as(@Vector(L, u64), @splat(0));
+        const match = @select(Score, present, @as(V, @splat(exact)), @as(V, @splat(typo)));
+
+        // The best case of each query byte, and the exclusive suffix sum of it:
+        // `after[j]` is the best case for the query bytes after j. The sum is a
+        // log2(L)-round scan, shifting lanes down and adding.
+        const zero: V = @splat(0);
+        const per_byte = @select(Score, in_query, match + @as(V, @splat(max_b)), zero);
+        var inclusive = per_byte;
+        comptime var k: usize = 1;
+        inline while (k < L) : (k *= 2) inclusive += shiftDown(L, inclusive, k);
+        const after = inclusive - per_byte;
+
+        // j is the first match, everything before it dropped
+        const j_skip = std.simd.iota(Score, L) * @as(V, @splat(cfg.skip_penalty));
+        const first = match + @as(V, @splat(max_b * cfg.first_char_multiplier)) - j_skip + after;
+        // Or an alignment that is already live at j
+        const live = @max(@as(V, state.full.m[0..L].*), @as(V, state.full.g[0..L].*));
+        const neg: V = @splat(NEG);
+        const from_live = @select(Score, live > neg, live + after, neg);
+
+        const best = @select(Score, in_query, @max(first, from_live), @as(V, @splat(std.math.minInt(Score))));
+        return @max(@as(i32, state.full.done), @as(i32, @reduce(.Max, best)));
+    }
+
+    /// The largest bonus a byte can earn when the bytes fed next have classes
+    /// in `mask` and the one before them is `prev`. A bonus kind needs its
+    /// trigger: `/` (in the mask, or `prev`) for path_boundary, punctuation
+    /// for boundary, a letter or digit for camel (the mask folds case, so an
+    /// uppercase letter can't be ruled out). The shared bucket of `byteBit`
+    /// may hold punctuation, so it counts as one. The consecutive bonus needs
+    /// nothing.
+    fn maxBonusBelow(self: *const Matcher, prev: u8, mask: u64) Score {
+        const cfg = &self.config;
+        const prev_class = byte_class[prev];
+        const alnum_bits: u64 = (@as(u64, 1) << 36) - 1;
+        const punct_bits: u64 = byteBit('.') | byteBit('_') | byteBit('-') | byteBit(' ') | (~@as(u64, 0) << 41);
+
+        var max_b = cfg.bonus_consecutive;
+        if (prev_class == .slash or mask & byteBit('/') != 0) max_b = @max(max_b, cfg.bonus_path_boundary);
+        if (prev_class == .punct or mask & punct_bits != 0) max_b = @max(max_b, cfg.bonus_boundary);
+        if (mask & alnum_bits != 0) max_b = @max(max_b, cfg.bonus_camel);
+        return max_b;
     }
 
     /// Whether a subtree with this bound can still produce a result that gets
@@ -443,6 +479,17 @@ const lowercase_table: [256]u8 = blk: {
 fn maxOfPrevTwo(comptime L: usize, v: @Vector(L, Score)) @Vector(L, Score) {
     const prev = shiftUp(L, v, 1);
     return @max(prev, shiftUp(L, prev, 1));
+}
+
+/// `v` moved `k` lanes down (lane j takes lane j+k), with 0 shifted into the
+/// top lanes.
+fn shiftDown(comptime L: usize, v: @Vector(L, Score), comptime k: usize) @Vector(L, Score) {
+    const mask = comptime blk: {
+        var m: @Vector(L, i32) = undefined;
+        for (0..L) |i| m[i] = if (i + k < L) @intCast(i + k) else -1;
+        break :blk m;
+    };
+    return @shuffle(Score, v, @as(@Vector(L, Score), @splat(0)), mask);
 }
 
 /// `v` moved `k` lanes up, with NEG shifted into the bottom lanes.
@@ -820,6 +867,14 @@ test "subtreeBound never undercuts what feeding the rest can reach" {
             }
         }
     }
+}
+
+test "subtreeBound is tighter when the subtree can't hold a word boundary" {
+    const m = try Matcher.init("main", .{});
+    var state = m.start();
+    m.feed(&state, "src/ma");
+    try testing.expect(m.subtreeBound(&state, labelMask("in")) < m.subtreeBound(&state, labelMask("in/")));
+    try testing.expect(m.subtreeBound(&state, labelMask("in")) < m.subtreeBound(&state, labelMask("in_")));
 }
 
 test "subtreeBound rules out subtrees missing query bytes, given a threshold" {

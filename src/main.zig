@@ -19,6 +19,7 @@ fn scanFolder(path: []const u8, position: fileIndex.Position) !void {
     defer dir.close(io);
 
     _ = try walk.walkSingleThreaded(&dir, position);
+    try index.refreshMasks(position, path);
 }
 
 fn addToIndex(path: []const u8, kind: watcher.Kind) !void {
@@ -95,17 +96,10 @@ fn queryLoop() !void {
     }
 }
 
-var _stringAllocator: std.heap.FixedBufferAllocator = undefined;
-var stringAllocator: std.mem.Allocator = undefined;
-
 pub fn createIndex(path: []const u8) !void {
-    // The index keeps pointers to both, so they must outlive this function
-    _stringAllocator = std.heap.FixedBufferAllocator.init(
-        try std.heap.page_allocator.alloc(u8, 50 * 1024 * 1024), // 50 MB
-    );
-    stringAllocator = _stringAllocator.allocator();
-
-    index = try fileIndex.init(&gpa, &stringAllocator, io);
+    // Reserves the trie's node and label buffers at their largest; pages are
+    // only backed as they fill up
+    index = try fileIndex.init(gpa, io, .{});
 
     const startTime = std.Io.Clock.awake.now(io);
     walk.index = index;
@@ -130,16 +124,16 @@ pub fn main(init: std.process.Init) !void {
     const fsWatcher = try watcher.Watcher.start(gpa, path, 0.1, onFsEvent, null);
     defer fsWatcher.stop(gpa);
 
-    const passsthroughCnt = index.rootPosition().scanPassthoughNodes();
-    const allCnt = index.rootPosition().scanAllNodes();
+    const passsthroughCnt = index.trie.scanPassthoughNodes();
+    const allCnt = index.trie.scanAllNodes();
     const ratio = @as(f64, @floatFromInt(passsthroughCnt)) / @as(f64, @floatFromInt(allCnt));
     std.debug.print("Passthrough nodes are {d} / {d} = {d:.2}\n", .{
         passsthroughCnt,
         allCnt,
         ratio,
     });
-    std.debug.print("Total chars used are {d}\n", .{index.rootPosition().scanTotalCharCount()});
-    std.debug.print("Total direct data used for nodes {d}\n", .{index.rootPosition().scanSize()});
+    std.debug.print("Total chars used are {d}\n", .{index.trie.scanTotalCharCount()});
+    std.debug.print("Total direct data used for nodes {d}\n", .{index.trie.scanSize()});
 
     try queryLoop();
 

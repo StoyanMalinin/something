@@ -1,366 +1,452 @@
+//! A compressed trie of paths, stored as one array of nodes linked by index.
+//!
+//! Every node holds the label of the edge into it, its first child and its
+//! next sibling, so a child is one 24-byte entry (no separate edge object,
+//! no pointers). Nodes and label bytes live in two buffers reserved once at
+//! the largest size allowed; the OS backs their pages only as they are used,
+//! and since they never move, an `Index` stays valid as long as its node is
+//! in the trie (positions are held across inserts by the walker threads).
+//!
+//! Removed nodes are reused through a free list. Removed label bytes are not
+//! reused; `dead_label_bytes` counts them.
+
 const std = @import("std");
 const fuzzy = @import("fuzzy.zig");
 
-const TrieChild = struct {
-    path: []const u8,
-    trie: *Trie,
+pub const Index = enum(u32) {
+    root = 0,
+    none = std.math.maxInt(u32),
+    _,
+};
 
-    node: std.SinglyLinkedList.Node = .{},
+pub const Node = struct {
+    /// The byte classes (`fuzzy.byteBit`) of this node's label and of
+    /// everything below, so a search can bound the best score in a subtree
+    /// (`fuzzy.Matcher.subtreeBound`) and skip it. Always covers the
+    /// children's masks; it may cover more after a removal, which only costs
+    /// pruning power.
+    ///
+    /// Nodes don't know their parent, so a change below a node can only reach
+    /// the masks of the nodes it went through. `add` and `adoptChildren` keep
+    /// the masks right from the node they are called on down; the nodes above
+    /// it are left stale. Changes made from the root are complete. After
+    /// changes below a deeper position, call `refreshMasks` from the root.
+    sub: u64,
+    first_child: Index,
+    /// Also links the free list.
+    next_sibling: Index,
+    /// The label of the edge into this node, in `Trie.labels`.
+    label_off: u32,
+    label_len: u16,
+    /// The label's first byte, so looking up a child doesn't touch the labels.
+    first_byte: u8,
+    is_final: bool,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(Node) == 24);
+}
+
+/// The most nodes and label bytes a trie can hold. Reserved up front, so
+/// the defaults cost address space, not memory.
+pub const Limits = struct {
+    max_nodes: u32 = 1 << 26, // 1.5 GiB of address space
+    max_label_bytes: u32 = 1 << 30,
 };
 
 pub const Trie = struct {
-    children: std.SinglyLinkedList,
-    isFinal: bool,
-    parent: ?*Trie = null,
-    /// The byte classes (`fuzzy.byteBit`) of the incoming edge's label and of
-    /// everything below, so a search can bound the best score in a subtree
-    /// (`fuzzy.Matcher.subtreeBound`) and skip it. Always covers the children's
-    /// masks; it may cover more after a removal, which only costs pruning power.
-    sub: u64 = 0,
+    allocator: std.mem.Allocator,
+    nodes: []Node,
+    node_count: u32,
+    free_nodes: Index = .none,
+    free_count: u32 = 0,
+    labels: []u8,
+    labels_used: u32 = 0,
+    dead_label_bytes: u32 = 0,
 
-    /// Adds byte classes to this node's mask and to its ancestors'. Stops at
-    /// the first one that has them all, since its ancestors do too.
-    fn widenMask(self: *Trie, mask: u64) void {
-        var node: ?*Trie = self;
-        while (node) |n| : (node = n.parent) {
-            if (n.sub & mask == mask) return;
-            n.sub |= mask;
-        }
+    pub fn init(allocator: std.mem.Allocator, limits: Limits) !Trie {
+        const nodes = try allocator.alloc(Node, limits.max_nodes);
+        errdefer allocator.free(nodes);
+        const labels = try allocator.alloc(u8, limits.max_label_bytes);
+
+        nodes[0] = .{
+            .sub = 0,
+            .first_child = .none,
+            .next_sibling = .none,
+            .label_off = 0,
+            .label_len = 0,
+            .first_byte = 0,
+            .is_final = false,
+        };
+        return .{ .allocator = allocator, .nodes = nodes, .node_count = 1, .labels = labels };
     }
 
-    /// Takes over `other`'s children (it keeps none), discarding its own.
-    pub fn adoptChildren(self: *Trie, other: *Trie, allocator: *std.mem.Allocator) void {
-        self.destroyChildren(allocator);
-        self.children = other.children;
-        other.children = .{};
-
-        var below: u64 = 0;
-        var node = self.children.first;
-        while (node) |n| : (node = n.next) {
-            const child: *TrieChild = @fieldParentPtr("node", n);
-            child.trie.parent = self;
-            below |= child.trie.sub;
-        }
-        self.widenMask(below);
+    pub fn deinit(self: *Trie) void {
+        self.allocator.free(self.nodes);
+        self.allocator.free(self.labels);
+        self.* = undefined;
     }
 
-    pub fn scanPassthoughNodes(self: *Trie) usize {
-        var cnt: usize = 0;
-        var childrenCnt: usize = 0;
-
-        var node = self.children.first;
-        while (node) |n| {
-            const child: *TrieChild = @fieldParentPtr("node", n);
-
-            childrenCnt += 1;
-            cnt += child.trie.scanPassthoughNodes();
-
-            node = n.next;
-        }
-
-        if (childrenCnt == 1) {
-            cnt += 1;
-        }
-
-        return cnt;
+    fn at(self: *Trie, i: Index) *Node {
+        return &self.nodes[@intFromEnum(i)];
     }
 
-    pub fn scanTotalCharCount(self: *Trie) usize {
-        var cnt: usize = 0;
-
-        var node = self.children.first;
-        while (node) |n| {
-            const child: *TrieChild = @fieldParentPtr("node", n);
-
-            cnt += child.path.len;
-            cnt += child.trie.scanTotalCharCount();
-
-            node = n.next;
-        }
-
-        return cnt;
+    fn label(self: *Trie, i: Index) []const u8 {
+        const n = self.at(i);
+        return self.labels[n.label_off..][0..n.label_len];
     }
 
-    pub fn scanSize(self: *Trie) usize {
-        var cnt: usize = @sizeOf(Trie);
-
-        var node = self.children.first;
-        while (node) |n| {
-            const child: *TrieChild = @fieldParentPtr("node", n);
-
-            cnt += @sizeOf(TrieChild);
-            cnt += child.path.len * @sizeOf(u8);
-            cnt += child.trie.scanSize();
-
-            node = n.next;
-        }
-
-        return cnt;
+    pub fn isFinal(self: *Trie, i: Index) bool {
+        return self.at(i).is_final;
     }
 
-    pub fn scanAllNodes(self: *Trie) usize {
-        var cnt: usize = 1;
+    // ------------------------------------------------------------ storage
 
-        var node = self.children.first;
-        while (node) |n| {
-            const child: *TrieChild = @fieldParentPtr("node", n);
-            cnt += child.trie.scanAllNodes();
-
-            node = n.next;
-        }
-
-        return cnt;
+    fn newNode(self: *Trie, label_off: u32, label_len: u16) error{OutOfMemory}!Index {
+        const i: Index = if (self.free_nodes != .none) blk: {
+            const reused = self.free_nodes;
+            self.free_nodes = self.at(reused).next_sibling;
+            self.free_count -= 1;
+            break :blk reused;
+        } else blk: {
+            if (self.node_count == self.nodes.len) return error.OutOfMemory;
+            self.node_count += 1;
+            break :blk @enumFromInt(self.node_count - 1);
+        };
+        self.at(i).* = .{
+            .sub = 0,
+            .first_child = .none,
+            .next_sibling = .none,
+            .label_off = label_off,
+            .label_len = label_len,
+            .first_byte = self.labels[label_off],
+            .is_final = false,
+        };
+        return i;
     }
 
-    pub fn countFinalNodes(self: *Trie) usize {
-        var cnt: usize = 0;
-        if (self.isFinal) {
-            cnt += 1;
-        }
+    /// A new node with a copy of `bytes` as its label.
+    fn newLeaf(self: *Trie, bytes: []const u8) error{ OutOfMemory, NameTooLong }!Index {
+        const len = std.math.cast(u16, bytes.len) orelse return error.NameTooLong;
+        if (self.labels.len - self.labels_used < len) return error.OutOfMemory;
+        const off = self.labels_used;
+        @memcpy(self.labels[off..][0..len], bytes);
+        self.labels_used += len;
 
-        var node = self.children.first;
-        while (node) |n| {
-            const child: *TrieChild = @fieldParentPtr("node", n);
-            cnt += child.trie.countFinalNodes();
-
-            node = n.next;
-        }
-
-        return cnt;
+        const i = try self.newNode(off, len);
+        self.at(i).sub = fuzzy.labelMask(bytes);
+        return i;
     }
 
-    fn getChildPtr(self: *Trie, c: u8) ?*TrieChild {
-        var node = self.children.first;
-        while (node) |n| {
-            const child: *TrieChild = @fieldParentPtr("node", n);
-            if (child.path[0] == c) {
-                return child;
+    fn freeNode(self: *Trie, i: Index) void {
+        std.debug.assert(i != .root);
+        const n = self.at(i);
+        self.dead_label_bytes += n.label_len;
+        n.first_child = .none;
+        n.next_sibling = self.free_nodes;
+        self.free_nodes = i;
+        self.free_count += 1;
+    }
+
+    /// Frees `i` and everything below it. `i` must not be linked into the trie.
+    pub fn freeSubtree(self: *Trie, i: Index) void {
+        var c = self.at(i).first_child;
+        while (c != .none) {
+            const next = self.at(c).next_sibling;
+            self.freeSubtree(c);
+            c = next;
+        }
+        self.freeNode(i);
+    }
+
+    // ---------------------------------------------------------- structure
+
+    fn findChild(self: *Trie, parent: Index, first: u8) Index {
+        var c = self.at(parent).first_child;
+        while (c != .none) : (c = self.at(c).next_sibling) {
+            if (self.at(c).first_byte == first) return c;
+        }
+        return .none;
+    }
+
+    fn prependChild(self: *Trie, parent: Index, child: Index) void {
+        self.at(child).next_sibling = self.at(parent).first_child;
+        self.at(parent).first_child = child;
+    }
+
+    /// Puts `replacement` where `old` is in `parent`'s children.
+    fn replaceChild(self: *Trie, parent: Index, old: Index, replacement: Index) void {
+        self.at(replacement).next_sibling = self.at(old).next_sibling;
+        self.at(old).next_sibling = .none;
+
+        const p = self.at(parent);
+        if (p.first_child == old) {
+            p.first_child = replacement;
+            return;
+        }
+        var c = p.first_child;
+        while (self.at(c).next_sibling != old) c = self.at(c).next_sibling;
+        self.at(c).next_sibling = replacement;
+    }
+
+    fn unlinkChild(self: *Trie, parent: Index, child: Index) void {
+        const p = self.at(parent);
+        if (p.first_child == child) {
+            p.first_child = self.at(child).next_sibling;
+        } else {
+            var c = p.first_child;
+            while (self.at(c).next_sibling != child) c = self.at(c).next_sibling;
+            self.at(c).next_sibling = self.at(child).next_sibling;
+        }
+        self.at(child).next_sibling = .none;
+    }
+
+    /// Splits `child`'s label after `len` bytes: a new node takes the first
+    /// part and `child`'s place under `parent`, and `child` keeps the rest
+    /// (and its index, so positions held on it stay valid).
+    fn splitAbove(self: *Trie, parent: Index, child: Index, len: u16) error{OutOfMemory}!Index {
+        const c = self.at(child);
+        const mid = try self.newNode(c.label_off, len);
+        // Covers both halves of the label and everything below. The lower node
+        // keeps its mask too, which still covers its (now shorter) label.
+        self.at(mid).sub = c.sub;
+        self.replaceChild(parent, child, mid);
+        self.at(mid).first_child = child;
+
+        c.label_off += len;
+        c.label_len -= len;
+        c.first_byte = self.labels[c.label_off];
+        return mid;
+    }
+
+    /// Adds `word` below `from` and returns the node it ends at.
+    pub fn add(self: *Trie, from: Index, word: []const u8) error{ OutOfMemory, NameTooLong }!Index {
+        std.debug.assert(word.len > 0);
+        var cur = from;
+        var rest = word;
+        while (true) {
+            const child = self.findChild(cur, rest[0]);
+            if (child == .none) {
+                const leaf = try self.newLeaf(rest);
+                self.at(leaf).is_final = true;
+                self.prependChild(cur, leaf);
+                // Every node on the way down from `from` now has these below
+                self.widenAlong(from, word, self.at(leaf).sub);
+                return leaf;
             }
 
-            node = n.next;
-        }
+            const lbl = self.label(child);
+            const common: u16 = @intCast(std.mem.indexOfDiff(u8, lbl, rest) orelse lbl.len);
+            if (common == lbl.len) {
+                if (common == rest.len) {
+                    self.at(child).is_final = true;
+                    return child;
+                }
+                cur = child;
+                rest = rest[common..];
+                continue;
+            }
 
+            // Ends or branches off inside the label: split it there
+            const mid = try self.splitAbove(cur, child, common);
+            if (common == rest.len) {
+                self.at(mid).is_final = true;
+                return mid;
+            }
+            cur = mid;
+            rest = rest[common..];
+        }
+    }
+
+    /// The node `word` ends at below `from`, if it ends exactly at one.
+    fn lookup(self: *Trie, from: Index, word: []const u8) ?struct { parent: Index, node: Index } {
+        var parent = from;
+        var rest = word;
+        while (rest.len > 0) {
+            const child = self.findChild(parent, rest[0]);
+            if (child == .none) return null;
+            const lbl = self.label(child);
+            if (!std.mem.startsWith(u8, rest, lbl)) return null;
+            if (rest.len == lbl.len) return .{ .parent = parent, .node = child };
+            parent = child;
+            rest = rest[lbl.len..];
+        }
         return null;
     }
 
-    fn appendChild(self: *Trie, child: *TrieChild) void {
-        self.children.prepend(&child.node);
+    /// Unlinks the final node `word` ends at, with everything below it, and
+    /// returns it for the caller to `freeSubtree` or `adoptChildren` from.
+    /// Null if `word` was never added (or only passes through a node).
+    pub fn removeRecursive(self: *Trie, from: Index, word: []const u8) ?Index {
+        const found = self.lookup(from, word) orelse return null;
+        if (!self.at(found.node).is_final) return null;
+        self.unlinkChild(found.parent, found.node);
+        return found.node;
     }
 
-    fn splitChild(self: *Trie, allocator: *std.mem.Allocator, child: *TrieChild, splitPos: usize) !*Trie {
-        const newChild = try allocator.create(TrieChild);
-        newChild.* = TrieChild{
-            .path = child.path[splitPos..],
-            .trie = child.trie,
-        };
-
-        const newNode = try initWithChild(allocator, newChild);
-        newNode.parent = self;
-        // Covers both halves of the label and everything below. The lower node
-        // keeps its mask too, which still covers its (now shorter) label.
-        newNode.sub = child.trie.sub;
-        child.trie.parent = newNode;
-
-        child.path = child.path[0..splitPos];
-        child.trie = newNode;
-
-        return newNode;
+    /// Unmarks `word` as added, keeping everything below it.
+    pub fn removeSingle(self: *Trie, from: Index, word: []const u8) ?Index {
+        const found = self.lookup(from, word) orelse return null;
+        if (!self.at(found.node).is_final) return null;
+        self.at(found.node).is_final = false;
+        return found.node;
     }
 
-    pub fn add(self: *Trie, word: []const u8, allocator: *std.mem.Allocator, stringAllocator: *std.mem.Allocator) !*Trie {
-        var node = self;
-
-        var childInProgress: ?*TrieChild = null;
-        var pathPos: usize = 0;
-
-        var i: i32 = 0;
-        while (i < word.len) {
-            defer i += 1;
-
-            const c = word[@intCast(i)];
-
-            if (pathPos == 0) {
-                if (node.getChildPtr(c)) |child| {
-                    pathPos += 1;
-                    childInProgress = child;
-                } else {
-                    const remLen = word.len - @as(usize, @intCast(i));
-
-                    const newNode = try init(allocator);
-                    const newChildPath = try stringAllocator.alloc(u8, remLen);
-                    @memcpy(newChildPath, word[@as(usize, @intCast(i))..]);
-                    const newChild = try allocator.create(TrieChild);
-                    newChild.* = TrieChild{
-                        .path = newChildPath,
-                        .trie = newNode,
-                    };
-                    node.appendChild(newChild);
-                    newNode.parent = node;
-                    newNode.widenMask(fuzzy.labelMask(newChildPath));
-
-                    childInProgress = newChild;
-                    pathPos = remLen;
-
-                    i = @as(i32, @intCast(word.len)) - 1;
-                    break;
-                }
-            } else {
-                if (pathPos == childInProgress.?.path.len) {
-                    node = childInProgress.?.trie;
-                    childInProgress = null;
-                    pathPos = 0;
-
-                    // Continue with the same character, but just move one level down
-                    i -= 1;
-                } else if (childInProgress.?.path[pathPos] == c) {
-                    pathPos += 1;
-                } else { // We have a mismatch, so we need to split the node
-                    const commonNode = try node.splitChild(allocator, childInProgress.?, pathPos);
-
-                    const remLen = word.len - @as(usize, @intCast(i));
-                    const newNode = try init(allocator);
-                    const newChildPath = try stringAllocator.alloc(u8, remLen);
-                    @memcpy(newChildPath, word[@as(usize, @intCast(i))..]);
-                    const newChild = try allocator.create(TrieChild);
-                    newChild.* = TrieChild{
-                        .path = newChildPath,
-                        .trie = newNode,
-                    };
-                    commonNode.appendChild(newChild);
-                    newNode.parent = commonNode;
-                    newNode.widenMask(fuzzy.labelMask(newChildPath));
-
-                    node = commonNode;
-                    childInProgress = newChild;
-                    pathPos = remLen;
-
-                    i = @as(i32, @intCast(word.len)) - 1;
-                    break;
-                }
-            }
+    /// Takes over `other`'s children (it keeps none), freeing `to`'s own.
+    /// Widens `to`'s mask, not its ancestors' (see `Node.sub`): returns the
+    /// children's byte classes, for `widenAlong` from above.
+    pub fn adoptChildren(self: *Trie, to: Index, other: Index) u64 {
+        var c = self.at(to).first_child;
+        while (c != .none) {
+            const next = self.at(c).next_sibling;
+            self.freeSubtree(c);
+            c = next;
         }
+        self.at(to).first_child = self.at(other).first_child;
+        self.at(other).first_child = .none;
 
-        if (childInProgress) |child| {
-            if (pathPos == child.path.len) {
-                child.trie.isFinal = true;
-                return child.trie;
-            }
-
-            // We are a proper prefix of an existing child, so we need to split
-
-            const newNode = try node.splitChild(allocator, child, pathPos);
-            newNode.isFinal = true;
-
-            return newNode;
-        } else {
-            unreachable;
-        }
-
-        return node;
+        var below: u64 = 0;
+        c = self.at(to).first_child;
+        while (c != .none) : (c = self.at(c).next_sibling) below |= self.at(c).sub;
+        self.at(to).sub |= below;
+        return below;
     }
 
-    pub fn removeRecursive(self: *Trie, word: []const u8, allocator: *std.mem.Allocator) ?*Trie {
-        if (word.len == 0) return null;
+    /// Frees a node unlinked by `removeRecursive` whose children were adopted.
+    pub fn freeEmptied(self: *Trie, i: Index) void {
+        std.debug.assert(self.at(i).first_child == .none);
+        self.freeNode(i);
+    }
 
-        const node = self.getChildPtr(word[0]);
-        if (node) |child| {
-            const len = child.path.len;
-            if (!std.mem.startsWith(u8, word, child.path)) {
-                return null;
-            }
+    // -------------------------------------------------------------- masks
 
-            if (word.len == len) {
-                // Only an intermediate node of the trie, the word itself was never added (or is already gone)
-                if (!child.trie.isFinal) {
-                    return null;
-                }
-
-                self.children.remove(&child.node);
-                const removed = child.trie;
-                allocator.destroy(child);
-                return removed;
-            } else {
-                return child.trie.removeRecursive(word[len..], allocator);
-            }
-        } else {
-            return null;
+    /// Adds `mask` to the masks of `from` and of every node on the way down
+    /// along `word`, which must be in the trie.
+    pub fn widenAlong(self: *Trie, from: Index, word: []const u8, mask: u64) void {
+        var cur = from;
+        var rest = word;
+        while (true) {
+            self.at(cur).sub |= mask;
+            if (rest.len == 0) return;
+            const child = self.findChild(cur, rest[0]);
+            if (child == .none) return;
+            const lbl = self.label(child);
+            if (!std.mem.startsWith(u8, rest, lbl)) return;
+            cur = child;
+            rest = rest[lbl.len..];
         }
     }
 
-    pub fn removeSingle(self: *Trie, word: []const u8) ?*Trie {
-        if (word.len == 0) return null;
-
-        const node = self.getChildPtr(word[0]);
-        if (node) |child| {
-            const len = child.path.len;
-            if (!std.mem.startsWith(u8, word, child.path)) {
-                return null;
-            }
-
-            if (word.len == len) {
-                // Only an intermediate node of the trie, the word itself was never added (or is already gone)
-                if (!child.trie.isFinal) {
-                    return null;
-                }
-
-                child.trie.isFinal = false;
-                return child.trie;
-            } else {
-                return child.trie.removeSingle(word[len..]);
-            }
-        } else {
-            return null;
+    /// Rebuilds the masks of everything below `i` from the labels. Returns
+    /// what `i`'s mask needs to cover from below.
+    pub fn recomputeMasks(self: *Trie, i: Index) u64 {
+        var below: u64 = 0;
+        var c = self.at(i).first_child;
+        while (c != .none) : (c = self.at(c).next_sibling) {
+            const sub = fuzzy.labelMask(self.label(c)) | self.recomputeMasks(c);
+            self.at(c).sub = sub;
+            below |= sub;
         }
+        return below;
     }
 
-    pub fn destroyChildren(self: *Trie, allocator: *std.mem.Allocator) void {
-        var node = self.children.first;
-        while (node) |n| {
-            const child: *TrieChild = @fieldParentPtr("node", n);
-            node = n.next;
-
-            child.trie.destroy(allocator);
-            allocator.destroy(child);
-        }
-
-        self.children = .{};
+    /// For after a bulk of changes below `position`, the node `word` leads to
+    /// from `from` (usually the root): rebuilds `position`'s subtree masks
+    /// and carries them up to `from`.
+    pub fn refreshMasks(self: *Trie, from: Index, word: []const u8, position: Index) void {
+        self.widenAlong(from, word, self.recomputeMasks(position));
     }
 
-    pub fn destroy(self: *Trie, allocator: *std.mem.Allocator) void {
-        self.destroyChildren(allocator);
-        allocator.destroy(self);
+    // -------------------------------------------------------------- stats
+
+    pub fn scanPassthoughNodes(self: *Trie) usize {
+        return self.passthroughBelow(.root);
     }
 
-    fn queryInternal(self: *Trie, word: []const u8, f: []const usize, matchLen: usize) usize {
-        if (matchLen == word.len) {
-            return self.countFinalNodes();
+    fn passthroughBelow(self: *Trie, i: Index) usize {
+        var cnt: usize = 0;
+        var children: usize = 0;
+        var c = self.at(i).first_child;
+        while (c != .none) : (c = self.at(c).next_sibling) {
+            children += 1;
+            cnt += self.passthroughBelow(c);
         }
+        return cnt + @intFromBool(children == 1);
+    }
+
+    /// Label bytes in use (not counting removed ones).
+    pub fn scanTotalCharCount(self: *Trie) usize {
+        return self.labels_used - self.dead_label_bytes;
+    }
+
+    /// Bytes of nodes and labels in use, including freed ones not yet reused.
+    pub fn scanSize(self: *Trie) usize {
+        return @as(usize, self.node_count) * @sizeOf(Node) + self.labels_used;
+    }
+
+    pub fn scanAllNodes(self: *Trie) usize {
+        return self.node_count - self.free_count;
+    }
+
+    pub fn countFinalNodes(self: *Trie) usize {
+        return self.finalsBelow(.root);
+    }
+
+    fn finalsBelow(self: *Trie, i: Index) usize {
+        var cnt: usize = @intFromBool(self.at(i).is_final);
+        var c = self.at(i).first_child;
+        while (c != .none) : (c = self.at(c).next_sibling) cnt += self.finalsBelow(c);
+        return cnt;
+    }
+
+    /// For tests: every node's mask covers its label and its children's masks.
+    pub fn masksAreConsistent(self: *Trie) bool {
+        return self.masksConsistentBelow(.root);
+    }
+
+    fn masksConsistentBelow(self: *Trie, i: Index) bool {
+        var c = self.at(i).first_child;
+        while (c != .none) : (c = self.at(c).next_sibling) {
+            const need = fuzzy.labelMask(self.label(c));
+            if (self.at(c).sub & need != need) return false;
+            if (self.at(i).sub & self.at(c).sub != self.at(c).sub) return false;
+            if (!self.masksConsistentBelow(c)) return false;
+        }
+        return true;
+    }
+
+    // ------------------------------------------------------------- search
+
+    /// How many added words contain `word`.
+    pub fn query(self: *Trie, word: []const u8) !usize {
+        var f = try self.allocator.alloc(usize, word.len);
+        defer self.allocator.free(f);
+
+        f[0] = 0;
+        for (1..word.len) |i| {
+            var j = f[i - 1];
+            while (j > 0 and word[i] != word[j]) j = f[j - 1];
+            if (word[i] == word[j]) j += 1;
+            f[i] = j;
+        }
+
+        return self.queryBelow(.root, word, f, 0);
+    }
+
+    fn queryBelow(self: *Trie, i: Index, word: []const u8, f: []const usize, matchLen: usize) usize {
+        if (matchLen == word.len) return self.finalsBelow(i);
 
         var cnt: usize = 0;
-        var node = self.children.first;
-
-        while (node) |n| {
-            const child: *TrieChild = @fieldParentPtr("node", n);
-
-            var newMatchLen = matchLen;
-            for (child.path) |c| {
-                while (newMatchLen > 0 and c != word[newMatchLen]) {
-                    newMatchLen = f[newMatchLen - 1];
-                }
-                if (c == word[newMatchLen]) {
-                    newMatchLen += 1;
-                }
-
-                if (newMatchLen == word.len) {
-                    break;
-                }
+        var c = self.at(i).first_child;
+        while (c != .none) : (c = self.at(c).next_sibling) {
+            var m = matchLen;
+            for (self.label(c)) |ch| {
+                while (m > 0 and ch != word[m]) m = f[m - 1];
+                if (ch == word[m]) m += 1;
+                if (m == word.len) break;
             }
-
-            cnt += child.trie.queryInternal(word, f, newMatchLen);
-
-            node = n.next;
+            cnt += self.queryBelow(c, word, f, m);
         }
-
         return cnt;
     }
 
@@ -392,12 +478,13 @@ pub const Trie = struct {
         defer path.deinit(allocator);
 
         var state: fuzzy.StateOf(L) = .{};
-        try self.fuzzyWalk(L, matcher, &state, &path, top, allocator, includeDirs);
+        try self.fuzzyWalk(L, .root, matcher, &state, &path, top, allocator, includeDirs);
     }
 
     fn fuzzyWalk(
         self: *Trie,
         comptime L: usize,
+        i: Index,
         matcher: *const fuzzy.Matcher,
         state: *const fuzzy.StateOf(L),
         path: *std.ArrayList(u8),
@@ -406,7 +493,7 @@ pub const Trie = struct {
         includeDirs: bool,
     ) error{OutOfMemory}!void {
         const items = path.items;
-        if (self.isFinal and items.len > 0 and (includeDirs or items[items.len - 1] != '/')) {
+        if (self.at(i).is_final and items.len > 0 and (includeDirs or items[items.len - 1] != '/')) {
             const tiebreak: u32 = @intCast(@min(items.len, std.math.maxInt(u32)));
             // Most finals can't make it even with the best filename match, and
             // that is the cheap check: the filename match is built only past it
@@ -422,237 +509,233 @@ pub const Trie = struct {
             }
         }
 
-        var node = self.children.first;
-        while (node) |n| : (node = n.next) {
-            const child: *TrieChild = @fieldParentPtr("node", n);
-
+        var c = self.at(i).first_child;
+        while (c != .none) : (c = self.at(c).next_sibling) {
             // Skip subtrees whose best possible score can't produce a result
-            const bound = matcher.subtreeBound(state, child.trie.sub);
+            const bound = matcher.subtreeBound(state, self.at(c).sub);
             if (!matcher.canReach(bound, top.threshold())) continue;
 
+            const lbl = self.label(c);
             var childState = state.*;
-            matcher.feed(&childState, child.path);
+            matcher.feed(&childState, lbl);
 
             const len = path.items.len;
-            try path.appendSlice(allocator, child.path);
+            try path.appendSlice(allocator, lbl);
             defer path.shrinkRetainingCapacity(len);
 
-            try child.trie.fuzzyWalk(L, matcher, &childState, path, top, allocator, includeDirs);
+            try self.fuzzyWalk(L, c, matcher, &childState, path, top, allocator, includeDirs);
         }
-    }
-
-    pub fn query(self: *Trie, word: []const u8, allocator: *std.mem.Allocator) !usize {
-        var f = try allocator.alloc(usize, word.len);
-        defer allocator.free(f);
-
-        f[0] = 0;
-        for (1..word.len) |i| {
-            var j = f[i - 1];
-            while (j > 0 and word[i] != word[j]) {
-                j = f[j - 1];
-            }
-            if (word[i] == word[j]) {
-                j += 1;
-            }
-
-            f[i] = j;
-        }
-
-        return self.queryInternal(word, f, 0);
     }
 };
 
-/// For tests: every node's mask covers its incoming label and its children's
-/// masks, and every child points back at its parent.
-pub fn masksAreConsistent(self: *Trie) bool {
-    var node = self.children.first;
-    while (node) |n| : (node = n.next) {
-        const child: *TrieChild = @fieldParentPtr("node", n);
-        if (child.trie.parent != self) return false;
-        const need = fuzzy.labelMask(child.path);
-        if (child.trie.sub & need != need) return false;
-        if (self.parent != null and self.sub & child.trie.sub != child.trie.sub) return false;
-        if (!masksAreConsistent(child.trie)) return false;
-    }
-    return true;
-}
+// ---------------------------------------------------------------- tests
 
-pub fn init(allocator: *std.mem.Allocator) !*Trie {
-    const t = try allocator.create(Trie);
-    t.* = Trie{
-        .children = .{},
-        .isFinal = false,
-    };
+const testing = std.testing;
+pub const test_limits: Limits = .{ .max_nodes = 1 << 12, .max_label_bytes = 1 << 16 };
 
-    return t;
-}
-
-fn initWithChild(allocator: *std.mem.Allocator, child: *TrieChild) !*Trie {
-    const t = try allocator.create(Trie);
-    t.* = Trie{
-        .children = .{},
-        .isFinal = false,
-    };
-    t.appendChild(child);
-
-    return t;
+fn testTrie() !Trie {
+    return Trie.init(testing.allocator, test_limits);
 }
 
 test "single add" {
-    var allocator = std.heap.page_allocator;
-    const trie = try init(&allocator);
-    defer allocator.destroy(trie);
+    var t = try testTrie();
+    defer t.deinit();
 
-    _ = try trie.add("abcd", &allocator, &allocator);
-
-    try std.testing.expectEqual(1, try trie.query("abcd", &allocator));
+    _ = try t.add(.root, "abcd");
+    try testing.expectEqual(1, try t.query("abcd"));
 }
 
 test "add that splits" {
-    var allocator = std.heap.page_allocator;
-    const trie = try init(&allocator);
-    defer allocator.destroy(trie);
+    var t = try testTrie();
+    defer t.deinit();
 
-    _ = try trie.add("abcd", &allocator, &allocator);
-    _ = try trie.add("abe", &allocator, &allocator);
+    _ = try t.add(.root, "abcd");
+    _ = try t.add(.root, "abe");
 
-    try std.testing.expectEqual(0, try trie.query("hello", &allocator));
-    try std.testing.expectEqual(2, try trie.query("ab", &allocator));
-    try std.testing.expectEqual(1, try trie.query("abcd", &allocator));
-    try std.testing.expectEqual(1, try trie.query("abe", &allocator));
+    try testing.expectEqual(0, try t.query("hello"));
+    try testing.expectEqual(2, try t.query("ab"));
+    try testing.expectEqual(1, try t.query("abcd"));
+    try testing.expectEqual(1, try t.query("abe"));
 }
 
 test "add that is a prefix of an existing file" {
-    var allocator = std.heap.page_allocator;
-    const trie = try init(&allocator);
-    defer allocator.destroy(trie);
+    var t = try testTrie();
+    defer t.deinit();
 
-    _ = try trie.add("hello", &allocator, &allocator);
-    _ = try trie.add("hell", &allocator, &allocator);
+    _ = try t.add(.root, "hello");
+    _ = try t.add(.root, "hell");
 
-    try std.testing.expectEqual(1, try trie.query("hello", &allocator));
-    try std.testing.expectEqual(2, try trie.query("hell", &allocator));
+    try testing.expectEqual(1, try t.query("hello"));
+    try testing.expectEqual(2, try t.query("hell"));
 }
 
 test "add a string and then extend it" {
-    var allocator = std.heap.page_allocator;
-    const trie = try init(&allocator);
-    defer allocator.destroy(trie);
+    var t = try testTrie();
+    defer t.deinit();
 
-    _ = try trie.add("hell", &allocator, &allocator);
-    _ = try trie.add("hello", &allocator, &allocator);
+    _ = try t.add(.root, "hell");
+    _ = try t.add(.root, "hello");
 
-    try std.testing.expectEqual(1, try trie.query("hello", &allocator));
-    try std.testing.expectEqual(2, try trie.query("hell", &allocator));
+    try testing.expectEqual(1, try t.query("hello"));
+    try testing.expectEqual(2, try t.query("hell"));
 }
 
 test "basic add" {
-    var allocator = std.heap.page_allocator;
-    const trie = try init(&allocator);
-    defer allocator.destroy(trie);
+    var t = try testTrie();
+    defer t.deinit();
 
-    _ = try trie.add("hello", &allocator, &allocator);
-    _ = try trie.add("hell", &allocator, &allocator);
-    _ = try trie.add("heaven", &allocator, &allocator);
+    _ = try t.add(.root, "hello");
+    _ = try t.add(.root, "hell");
+    _ = try t.add(.root, "heaven");
 
-    try std.testing.expectEqual(3, try trie.query("he", &allocator));
-    try std.testing.expectEqual(2, try trie.query("hell", &allocator));
-    try std.testing.expectEqual(1, try trie.query("hello", &allocator));
+    try testing.expectEqual(3, try t.query("he"));
+    try testing.expectEqual(2, try t.query("hell"));
+    try testing.expectEqual(1, try t.query("hello"));
 }
 
-test "add with chainining" {
-    var allocator = std.heap.page_allocator;
-    const trie = try init(&allocator);
-    defer allocator.destroy(trie);
+test "add with chaining" {
+    var t = try testTrie();
+    defer t.deinit();
 
-    var subTrie = try trie.add("he", &allocator, &allocator);
-    _ = try subTrie.add("llo", &allocator, &allocator);
-    var subSubTrie = try subTrie.add("ro", &allocator, &allocator);
-    _ = try subSubTrie.add("ic", &allocator, &allocator);
+    const he = try t.add(.root, "he");
+    _ = try t.add(he, "llo");
+    const hero = try t.add(he, "ro");
+    _ = try t.add(hero, "ic");
 
-    try std.testing.expectEqual(4, try trie.query("h", &allocator));
-    try std.testing.expectEqual(3, try trie.query("o", &allocator));
-    try std.testing.expectEqual(1, try trie.query("hello", &allocator));
-    try std.testing.expectEqual(2, try trie.query("hero", &allocator));
-    try std.testing.expectEqual(1, try trie.query("heroic", &allocator));
+    try testing.expectEqual(4, try t.query("h"));
+    try testing.expectEqual(3, try t.query("o"));
+    try testing.expectEqual(1, try t.query("hello"));
+    try testing.expectEqual(2, try t.query("hero"));
+    try testing.expectEqual(1, try t.query("heroic"));
+}
+
+test "a split keeps the index of the node below it" {
+    var t = try testTrie();
+    defer t.deinit();
+
+    const hello = try t.add(.root, "hello");
+    _ = try t.add(.root, "help");
+    try testing.expectEqual(hello, try t.add(.root, "hello"));
+    const hell = try t.add(.root, "hell");
+    try testing.expect(hell != hello);
+    try testing.expectEqual(hello, try t.add(hell, "o"));
 }
 
 test "removeRecursive" {
-    var allocator = std.heap.page_allocator;
-    const trie = try init(&allocator);
-    defer allocator.destroy(trie);
+    var t = try testTrie();
+    defer t.deinit();
 
-    _ = try trie.add("he", &allocator, &allocator);
-    _ = try trie.add("hell", &allocator, &allocator);
-    _ = try trie.add("hello", &allocator, &allocator);
-    _ = try trie.add("heaven", &allocator, &allocator);
+    _ = try t.add(.root, "he");
+    _ = try t.add(.root, "hell");
+    _ = try t.add(.root, "hello");
+    _ = try t.add(.root, "heaven");
 
-    try std.testing.expectEqual(4, try trie.query("he", &allocator));
+    try testing.expectEqual(4, try t.query("he"));
 
-    _ = trie.removeRecursive("heaven", &allocator);
-    try std.testing.expectEqual(3, try trie.query("he", &allocator));
+    t.freeSubtree(t.removeRecursive(.root, "heaven").?);
+    try testing.expectEqual(3, try t.query("he"));
 
-    _ = trie.removeRecursive("hell", &allocator);
-    try std.testing.expectEqual(1, try trie.query("he", &allocator));
+    t.freeSubtree(t.removeRecursive(.root, "hell").?);
+    try testing.expectEqual(1, try t.query("he"));
 
-    _ = trie.removeRecursive("he", &allocator);
-    try std.testing.expectEqual(0, try trie.query("he", &allocator));
+    t.freeSubtree(t.removeRecursive(.root, "he").?);
+    try testing.expectEqual(0, try t.query("he"));
+    try testing.expectEqual(1, t.scanAllNodes()); // only the root is left
 }
 
 test "removeRecursive with missing, short and empty words" {
-    var allocator = std.heap.page_allocator;
-    const trie = try init(&allocator);
-    defer allocator.destroy(trie);
+    var t = try testTrie();
+    defer t.deinit();
 
-    _ = try trie.add("hello", &allocator, &allocator);
-    _ = try trie.add("heaven", &allocator, &allocator);
+    _ = try t.add(.root, "hello");
+    _ = try t.add(.root, "heaven");
 
-    try std.testing.expectEqual(null, trie.removeRecursive("zzz", &allocator));
-    try std.testing.expectEqual(null, trie.removeRecursive("hex", &allocator));
-    try std.testing.expectEqual(null, trie.removeRecursive("hel", &allocator));
-    try std.testing.expectEqual(null, trie.removeRecursive("", &allocator));
+    try testing.expectEqual(null, t.removeRecursive(.root, "zzz"));
+    try testing.expectEqual(null, t.removeRecursive(.root, "hex"));
+    try testing.expectEqual(null, t.removeRecursive(.root, "hel"));
+    try testing.expectEqual(null, t.removeRecursive(.root, ""));
     // "he" is only the shared start of the two words, it must not take them along
-    try std.testing.expectEqual(null, trie.removeRecursive("he", &allocator));
-    try std.testing.expectEqual(2, try trie.query("he", &allocator));
+    try testing.expectEqual(null, t.removeRecursive(.root, "he"));
+    try testing.expectEqual(2, try t.query("he"));
 }
 
 test "removeSingle" {
-    var allocator = std.heap.page_allocator;
-    const trie = try init(&allocator);
-    defer allocator.destroy(trie);
+    var t = try testTrie();
+    defer t.deinit();
 
-    _ = try trie.add("he", &allocator, &allocator);
-    _ = try trie.add("hell", &allocator, &allocator);
-    _ = try trie.add("hello", &allocator, &allocator);
-    _ = try trie.add("heaven", &allocator, &allocator);
+    _ = try t.add(.root, "he");
+    _ = try t.add(.root, "hell");
+    _ = try t.add(.root, "hello");
+    _ = try t.add(.root, "heaven");
 
-    try std.testing.expectEqual(4, try trie.query("he", &allocator));
+    try testing.expectEqual(4, try t.query("he"));
 
     // A word that is a prefix of other words: only it is removed, its descendants stay
-    try std.testing.expect(trie.removeSingle("hell") != null);
-    try std.testing.expectEqual(3, try trie.query("he", &allocator));
-    try std.testing.expectEqual(1, try trie.query("hell", &allocator));
+    try testing.expect(t.removeSingle(.root, "hell") != null);
+    try testing.expectEqual(3, try t.query("he"));
+    try testing.expectEqual(1, try t.query("hell"));
 
     // Already removed, never added, ending in the middle of an edge, and empty
-    try std.testing.expectEqual(null, trie.removeSingle("hell"));
-    try std.testing.expectEqual(null, trie.removeSingle("hex"));
-    try std.testing.expectEqual(null, trie.removeSingle("hel"));
-    try std.testing.expectEqual(null, trie.removeSingle(""));
-    try std.testing.expectEqual(3, try trie.query("he", &allocator));
+    try testing.expectEqual(null, t.removeSingle(.root, "hell"));
+    try testing.expectEqual(null, t.removeSingle(.root, "hex"));
+    try testing.expectEqual(null, t.removeSingle(.root, "hel"));
+    try testing.expectEqual(null, t.removeSingle(.root, ""));
+    try testing.expectEqual(3, try t.query("he"));
 }
 
-test "masks and parents stay consistent through adds and splits" {
-    var allocator = std.heap.page_allocator;
-    const trie = try init(&allocator);
-    defer trie.destroy(&allocator);
+test "freed nodes are reused" {
+    var t = try testTrie();
+    defer t.deinit();
+
+    _ = try t.add(.root, "a/b/c");
+    _ = try t.add(.root, "a/x");
+    const count = t.node_count;
+    t.freeSubtree(t.removeRecursive(.root, "a/x").?);
+    _ = try t.add(.root, "a/y");
+    try testing.expectEqual(count, t.node_count);
+    try testing.expectEqual(1, t.dead_label_bytes);
+}
+
+test "masks stay consistent through adds and splits" {
+    var t = try testTrie();
+    defer t.deinit();
 
     for ([_][]const u8{ "hello", "hell", "heaven", "he", "help/me", "help/you", "x/y/z", "x/yy" }) |w| {
-        _ = try trie.add(w, &allocator, &allocator);
-        try std.testing.expect(masksAreConsistent(trie));
+        _ = try t.add(.root, w);
+        try testing.expect(t.masksAreConsistent());
     }
-    // Adding below a position deep in the trie reaches the masks above it
-    const sub = try trie.add("deep/", &allocator, &allocator);
-    _ = try sub.add("qqq", &allocator, &allocator);
-    try std.testing.expect(masksAreConsistent(trie));
-    try std.testing.expect(trie.getChildPtr('d').?.trie.sub & fuzzy.byteBit('q') != 0);
+    // Adding below a deeper position leaves the masks above it stale, until
+    // they are refreshed from the root
+    const deep = try t.add(.root, "deep/");
+    _ = try t.add(deep, "qqq");
+    _ = try t.add(deep, "q/r/s");
+    try testing.expect(t.at(deep).sub & fuzzy.byteBit('q') != 0);
+    try testing.expect(t.at(.root).sub & fuzzy.byteBit('q') == 0);
+    t.refreshMasks(.root, "deep/", deep);
+    try testing.expect(t.masksAreConsistent());
+    try testing.expect(t.at(.root).sub & fuzzy.byteBit('r') != 0);
+}
+
+test "recomputing masks gives what adds from the root keep up" {
+    var t = try testTrie();
+    defer t.deinit();
+
+    for ([_][]const u8{ "hello", "hell", "heaven", "he", "help/me", "help/you", "x/y/z", "x/yy", "x/" }) |w| {
+        _ = try t.add(.root, w);
+    }
+    const x = t.findChild(.root, 'x');
+    const kept = t.at(x).sub;
+    try testing.expectEqual(t.at(.root).sub, t.recomputeMasks(.root));
+    try testing.expectEqual(kept, t.at(x).sub);
+    try testing.expect(t.masksAreConsistent());
+}
+
+test "running out of room is an error, not a crash" {
+    var t = try Trie.init(testing.allocator, .{ .max_nodes = 3, .max_label_bytes = 8 });
+    defer t.deinit();
+
+    _ = try t.add(.root, "abc");
+    try testing.expectError(error.OutOfMemory, t.add(.root, "xxxxxx"));
+    _ = try t.add(.root, "ab"); // a split, no new label bytes
+    try testing.expectError(error.OutOfMemory, t.add(.root, "q"));
 }

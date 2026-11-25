@@ -2,7 +2,7 @@ const std = @import("std");
 const trie = @import("trie.zig");
 const fuzzy = @import("fuzzy.zig");
 
-pub const Position = *trie.Trie;
+pub const Position = trie.Index;
 
 pub const SearchOptions = struct {
     limit: usize = 50,
@@ -25,12 +25,16 @@ const KeyBuf = [std.Io.Dir.max_path_bytes + 1]u8;
 pub const FileIndex = struct {
     io: std.Io,
     mut: std.Io.Mutex,
-    trie: *trie.Trie,
-    allocator: *std.mem.Allocator,
-    stringAllocator: *std.mem.Allocator,
+    trie: trie.Trie,
+    allocator: std.mem.Allocator,
 
-    pub fn rootPosition(self: *FileIndex) *trie.Trie {
-        return self.trie;
+    pub fn rootPosition(_: *FileIndex) Position {
+        return .root;
+    }
+
+    pub fn deinit(self: *FileIndex) void {
+        self.trie.deinit();
+        self.allocator.destroy(self);
     }
 
     fn entryKey(name: []const u8, isDir: bool, buf: *KeyBuf) ![]const u8 {
@@ -46,21 +50,35 @@ pub const FileIndex = struct {
         return buf[0 .. name.len + 1];
     }
 
-    pub fn addFileName(self: *FileIndex, position: *trie.Trie, name: []const u8, isDir: bool) !*trie.Trie {
+    /// Adding below a position other than the root leaves the search masks
+    /// above that position stale: call `refreshMasks` once done (see `trie.Trie.sub`).
+    pub fn addFileName(self: *FileIndex, position: Position, name: []const u8, isDir: bool) !Position {
         var buf: KeyBuf = undefined;
         const key = try entryKey(name, isDir, &buf);
 
         self.mut.lockUncancelable(self.io);
         defer self.mut.unlock(self.io);
 
-        return position.add(key, self.allocator, self.stringAllocator);
+        return self.trie.add(position, key);
+    }
+
+    /// After adding entries below `position`, the folder `name` from the root:
+    /// brings the search masks of its subtree and the folders above it up to date.
+    pub fn refreshMasks(self: *FileIndex, position: Position, name: []const u8) !void {
+        var buf: KeyBuf = undefined;
+        const key = try entryKey(name, true, &buf);
+
+        self.mut.lockUncancelable(self.io);
+        defer self.mut.unlock(self.io);
+
+        self.trie.refreshMasks(.root, key, position);
     }
 
     pub fn query(self: *FileIndex, name: []const u8) !usize {
         self.mut.lockUncancelable(self.io);
         defer self.mut.unlock(self.io);
 
-        return self.trie.query(name, self.allocator);
+        return self.trie.query(name);
     }
 
     pub fn search(
@@ -90,7 +108,7 @@ pub const FileIndex = struct {
         return results;
     }
 
-    pub fn removeFileName(self: *FileIndex, position: *trie.Trie, name: []const u8, isDir: bool) !bool {
+    pub fn removeFileName(self: *FileIndex, position: Position, name: []const u8, isDir: bool) !bool {
         var buf: KeyBuf = undefined;
         const key = try entryKey(name, isDir, &buf);
 
@@ -99,19 +117,19 @@ pub const FileIndex = struct {
 
         if (isDir) {
             std.debug.assert(std.mem.endsWith(u8, key, "/"));
-            const removed = position.removeRecursive(key, self.allocator) orelse return false;
-            removed.destroy(self.allocator);
+            const removed = self.trie.removeRecursive(position, key) orelse return false;
+            self.trie.freeSubtree(removed);
             return true;
         }
 
-        return position.removeSingle(key) != null;
+        return self.trie.removeSingle(position, key) != null;
     }
 
     pub fn moveOrdinaryFile(
         self: *FileIndex,
-        fromPosition: *trie.Trie,
+        fromPosition: Position,
         fromName: []const u8,
-        toPosition: *trie.Trie,
+        toPosition: Position,
         toName: []const u8,
     ) !bool {
         var fromBuf: KeyBuf = undefined;
@@ -122,19 +140,19 @@ pub const FileIndex = struct {
         self.mut.lockUncancelable(self.io);
         defer self.mut.unlock(self.io);
 
-        if (fromPosition.removeSingle(fromKey) == null) {
+        if (self.trie.removeSingle(fromPosition, fromKey) == null) {
             return false;
         }
 
-        _ = try toPosition.add(toKey, self.allocator, self.stringAllocator);
+        _ = try self.trie.add(toPosition, toKey);
         return true;
     }
 
     pub fn moveFolder(
         self: *FileIndex,
-        fromPosition: *trie.Trie,
+        fromPosition: Position,
         fromName: []const u8,
-        toPosition: *trie.Trie,
+        toPosition: Position,
         toName: []const u8,
     ) !bool {
         var fromBuf: KeyBuf = undefined;
@@ -145,33 +163,36 @@ pub const FileIndex = struct {
         self.mut.lockUncancelable(self.io);
         defer self.mut.unlock(self.io);
 
-        const old = fromPosition.removeRecursive(fromKey, self.allocator) orelse return false;
-        errdefer old.destroy(self.allocator);
-        const moved = try toPosition.add(toKey, self.allocator, self.stringAllocator);
+        const old = self.trie.removeRecursive(fromPosition, fromKey) orelse return false;
+        errdefer self.trie.freeSubtree(old);
+        const moved = try self.trie.add(toPosition, toKey);
 
         // An existing folder at the destination is replaced
-        moved.adoptChildren(old, self.allocator);
-        self.allocator.destroy(old);
+        const below = self.trie.adoptChildren(moved, old);
+        self.trie.freeEmptied(old);
+        // The adopted children's byte classes, for the folders above
+        self.trie.widenAlong(toPosition, toKey, below);
         return true;
     }
 };
 
-pub fn init(allocator: *std.mem.Allocator, stringAllocator: *std.mem.Allocator, io: std.Io) !*FileIndex {
+/// `limits` bounds the trie; its storage is reserved up front (see `trie.Limits`).
+pub fn init(allocator: std.mem.Allocator, io: std.Io, limits: trie.Limits) !*FileIndex {
     const t = try allocator.create(FileIndex);
+    errdefer allocator.destroy(t);
     t.* = FileIndex{
-        .trie = try trie.init(allocator),
+        .trie = try trie.Trie.init(allocator, limits),
         .io = io,
         .mut = .init,
         .allocator = allocator,
-        .stringAllocator = stringAllocator,
     };
 
     return t;
 }
 
 test "siblings that share a prefix do not collide" {
-    var allocator = std.heap.page_allocator;
-    const index = try init(&allocator, &allocator, std.testing.io);
+    const index = try init(std.testing.allocator, std.testing.io, trie.test_limits);
+    defer index.deinit();
 
     // /r/, /r/foo/, /r/foo/bar and /r/foobar
     const root = try index.addFileName(index.rootPosition(), "/r", true);
@@ -185,8 +206,8 @@ test "siblings that share a prefix do not collide" {
 }
 
 test "a root that already ends with a slash is not doubled" {
-    var allocator = std.heap.page_allocator;
-    const index = try init(&allocator, &allocator, std.testing.io);
+    const index = try init(std.testing.allocator, std.testing.io, trie.test_limits);
+    defer index.deinit();
 
     const root = try index.addFileName(index.rootPosition(), "/", true);
     const etc = try index.addFileName(root, "etc", true);
@@ -197,8 +218,8 @@ test "a root that already ends with a slash is not doubled" {
 }
 
 test "removing a directory takes its contents but not its siblings" {
-    var allocator = std.heap.page_allocator;
-    const index = try init(&allocator, &allocator, std.testing.io);
+    const index = try init(std.testing.allocator, std.testing.io, trie.test_limits);
+    defer index.deinit();
 
     const root = try index.addFileName(index.rootPosition(), "/r", true);
     const foo = try index.addFileName(root, "foo", true);
@@ -221,8 +242,8 @@ test "removing a directory takes its contents but not its siblings" {
 }
 
 test "a file and a directory with the same name are removed separately" {
-    var allocator = std.heap.page_allocator;
-    const index = try init(&allocator, &allocator, std.testing.io);
+    const index = try init(std.testing.allocator, std.testing.io, trie.test_limits);
+    defer index.deinit();
 
     const root = try index.addFileName(index.rootPosition(), "/r", true);
     const file = try index.addFileName(root, "foo", false);
@@ -240,8 +261,8 @@ test "a file and a directory with the same name are removed separately" {
 }
 
 test "moving an ordinary file" {
-    var allocator = std.heap.page_allocator;
-    const index = try init(&allocator, &allocator, std.testing.io);
+    const index = try init(std.testing.allocator, std.testing.io, trie.test_limits);
+    defer index.deinit();
 
     const root = try index.addFileName(index.rootPosition(), "/r", true);
     const a = try index.addFileName(root, "a", true);
@@ -267,8 +288,8 @@ test "moving an ordinary file" {
 }
 
 test "moving a folder" {
-    var allocator = std.heap.page_allocator;
-    const index = try init(&allocator, &allocator, std.testing.io);
+    const index = try init(std.testing.allocator, std.testing.io, trie.test_limits);
+    defer index.deinit();
 
     // /r/ with a/b/f.txt, a sibling file a.txt and an empty folder d/
     const root = try index.addFileName(index.rootPosition(), "/r", true);
@@ -285,7 +306,7 @@ test "moving a folder" {
     try std.testing.expectEqual(1, try index.query("a.txt"));
     try std.testing.expectEqual(6, index.trie.countFinalNodes());
     // Positions below the moved folder are still the same nodes
-    try std.testing.expect(b.isFinal and f.isFinal);
+    try std.testing.expect(index.trie.isFinal(b) and index.trie.isFinal(f));
 
     // A rename inside the same folder
     try std.testing.expectEqual(true, try index.moveFolder(root, "d", root, "e"));
@@ -301,15 +322,8 @@ test "moving a folder" {
 }
 
 test "removed and moved folders are freed" {
-    // Fails the test on a leak. The strings are never freed one by one, so they get an arena.
-    var allocator = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    var strings = arena.allocator();
-
-    const index = try init(&allocator, &strings, std.testing.io);
-    defer allocator.destroy(index);
-    defer index.trie.destroy(&allocator);
+    const index = try init(std.testing.allocator, std.testing.io, trie.test_limits);
+    defer index.deinit();
 
     const root = try index.addFileName(index.rootPosition(), "/r", true);
     const a = try index.addFileName(root, "a", true);
@@ -319,6 +333,8 @@ test "removed and moved folders are freed" {
     _ = try index.addFileName(d, "old.txt", false);
     const e = try index.addFileName(root, "e", true);
     _ = try index.addFileName(e, "g.txt", false);
+    // As the walker does once done, since these adds were below `root`
+    try index.refreshMasks(root, "/r");
 
     // Onto a folder that already has content: what was there is freed
     try std.testing.expectEqual(true, try index.moveFolder(root, "a", root, "d"));
@@ -326,7 +342,7 @@ test "removed and moved folders are freed" {
     try std.testing.expectEqual(1, try index.query("d/b/f.txt"));
 
     // The moved contents' bytes are now covered by the destination's masks
-    try std.testing.expect(trie.masksAreConsistent(index.trie));
+    try std.testing.expect(index.trie.masksAreConsistent());
     const found = try index.search(std.heap.page_allocator, "dbftxt", .{});
     defer freeSearchResults(std.heap.page_allocator, found);
     try std.testing.expectEqualStrings("/r/d/b/f.txt", found[0].path);
@@ -347,17 +363,14 @@ fn buildSearchFixture(index: *FileIndex) !void {
     _ = try index.addFileName(root, "build.zig", false);
     const docs = try index.addFileName(root, "docs", true);
     _ = try index.addFileName(docs, "notes.md", false);
+    // As the walker does once done, since these adds were below `root`
+    try index.refreshMasks(root, "/p");
 }
 
 test "fuzzy search ranks full paths, best first" {
-    var allocator = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    var strings = arena.allocator();
-
-    const index = try init(&allocator, &strings, std.testing.io);
-    defer allocator.destroy(index);
-    defer index.trie.destroy(&allocator);
+    const allocator = std.testing.allocator;
+    const index = try init(allocator, std.testing.io, trie.test_limits);
+    defer index.deinit();
     try buildSearchFixture(index);
 
     // Every entry gets a score; the real match leads
@@ -379,14 +392,9 @@ test "fuzzy search ranks full paths, best first" {
 }
 
 test "fuzzy search respects the limit and can leave out directories" {
-    var allocator = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    var strings = arena.allocator();
-
-    const index = try init(&allocator, &strings, std.testing.io);
-    defer allocator.destroy(index);
-    defer index.trie.destroy(&allocator);
+    const allocator = std.testing.allocator;
+    const index = try init(allocator, std.testing.io, trie.test_limits);
+    defer index.deinit();
     try buildSearchFixture(index);
 
     // Empty query matches every entry: /p/, src/, docs/ and 6 files
@@ -410,14 +418,9 @@ test "fuzzy search respects the limit and can leave out directories" {
 }
 
 test "fuzzy search over the trie matches scoring each path on its own" {
-    var allocator = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    var strings = arena.allocator();
-
-    const index = try init(&allocator, &strings, std.testing.io);
-    defer allocator.destroy(index);
-    defer index.trie.destroy(&allocator);
+    const allocator = std.testing.allocator;
+    const index = try init(allocator, std.testing.io, trie.test_limits);
+    defer index.deinit();
     try buildSearchFixture(index);
 
     const all = try index.search(allocator, "", .{ .limit = 100 });
@@ -448,14 +451,9 @@ test "fuzzy search over the trie matches scoring each path on its own" {
 }
 
 test "a directory comes before its own contents when the query names it" {
-    var allocator = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    var strings = arena.allocator();
-
-    const index = try init(&allocator, &strings, std.testing.io);
-    defer allocator.destroy(index);
-    defer index.trie.destroy(&allocator);
+    const allocator = std.testing.allocator;
+    const index = try init(allocator, std.testing.io, trie.test_limits);
+    defer index.deinit();
     try buildSearchFixture(index);
 
     for ([_][]const u8{ "src/", "src" }) |q| {
@@ -466,14 +464,9 @@ test "a directory comes before its own contents when the query names it" {
 }
 
 test "pruned search returns the same top results as scoring every path" {
-    var allocator = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    var strings = arena.allocator();
-
-    const index = try init(&allocator, &strings, std.testing.io);
-    defer allocator.destroy(index);
-    defer index.trie.destroy(&allocator);
+    const allocator = std.testing.allocator;
+    const index = try init(allocator, std.testing.io, trie.test_limits);
+    defer index.deinit();
 
     // Random folders and files over a small alphabet, so names share prefixes
     var prng = std.Random.DefaultPrng.init(7);

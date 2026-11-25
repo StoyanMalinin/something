@@ -127,5 +127,8 @@ pub fn walk(path: []const u8) !i32 {
 
     try group.await(io);
 
+    // The masks above each walker's starting position missed its adds
+    try index.refreshMasks(pathPosition, path);
+
     return cnt;
 }
