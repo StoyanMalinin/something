@@ -28,6 +28,27 @@
 const std = @import("std");
 const fuzzy = @import("fuzzy.zig");
 const vanilla = @import("vanilla-trie.zig");
+const build_options = @import("build_options");
+
+/// Whether the search counts its work (`zig build -Dstats=true`).
+pub const collect_stats = build_options.stats;
+
+/// What one search did, when `collect_stats` is on.
+pub const SearchStats = struct {
+    internal_seen: u64 = 0,
+    internal_pruned: u64 = 0,
+    leaves_seen: u64 = 0,
+    leaves_pruned: u64 = 0,
+    /// Label bytes fed to the matcher, and those of pruned children (not fed).
+    internal_bytes_fed: u64 = 0,
+    leaf_bytes_fed: u64 = 0,
+    bytes_pruned: u64 = 0,
+    /// Complete words reached, those `finishBound` let through to a full
+    /// `finish`, and those that made the top.
+    finals_seen: u64 = 0,
+    finals_scored: u64 = 0,
+    finals_kept: u64 = 0,
+};
 
 pub const Index = enum(u32) {
     root = 0,
@@ -118,6 +139,8 @@ pub const Trie = struct {
     dead_bytes: usize = 0,
     /// Where new entries are put together before they go into a block.
     scratch: std.ArrayList(u8) = .empty,
+    /// The last search's work, when `collect_stats` is on.
+    stats: SearchStats = .{},
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) !Trie {
         const bytes = try allocator.alloc(u8, limits.max_bytes);
@@ -788,12 +811,14 @@ pub const Trie = struct {
         defer path.deinit(allocator);
 
         var state: fuzzy.StateOf(L) = .{};
+        self.stats = .{};
         try self.fuzzyWalk(L, self.entry(0), matcher, &state, &path, top, allocator, includeDirs);
     }
 
     /// Scores `items`, a final word the walk has fed into `state`, and keeps
     /// it if it makes the top.
     fn consider(
+        self: *Trie,
         comptime L: usize,
         matcher: *const fuzzy.Matcher,
         state: *const fuzzy.StateOf(L),
@@ -803,13 +828,16 @@ pub const Trie = struct {
         includeDirs: bool,
     ) error{OutOfMemory}!void {
         if (items.len == 0 or !(includeDirs or items[items.len - 1] != '/')) return;
+        if (collect_stats) self.stats.finals_seen += 1;
         const tiebreak: u32 = @intCast(@min(items.len, std.math.maxInt(u32)));
         // Most finals can't make it even with the best filename match, and
         // that is the cheap check: the filename match is built only past it
         const bound = matcher.finishBound(state) orelse return;
         if (!top.accepts(bound, tiebreak)) return;
+        if (collect_stats) self.stats.finals_scored += 1;
         const score = matcher.finish(state, items) orelse return;
         if (!top.accepts(score, tiebreak)) return;
+        if (collect_stats) self.stats.finals_kept += 1;
         const copy = try allocator.dupe(u8, items);
         if (top.push(score, tiebreak, copy)) |dropped| allocator.free(dropped);
     }
@@ -825,7 +853,7 @@ pub const Trie = struct {
         allocator: std.mem.Allocator,
         includeDirs: bool,
     ) error{OutOfMemory}!void {
-        if (self.finalAt(e)) try consider(L, matcher, state, path.items, top, allocator, includeDirs);
+        if (self.finalAt(e)) try self.consider(L, matcher, state, path.items, top, allocator, includeDirs);
 
         // One pass over the level: labels and masks are side by side
         var it = self.children(e);
@@ -834,7 +862,18 @@ pub const Trie = struct {
             // Skip what can't produce a result; leaves have no stored mask
             const mask = if (c.internal) self.subAt(c) else fuzzy.labelMask(lbl);
             const bound = matcher.subtreeBound(state, mask);
-            if (!matcher.canReach(bound, top.threshold())) continue;
+            // Every word below is at least the path so far plus this label long
+            const min_len = @min(path.items.len + lbl.len, std.math.maxInt(u32));
+            const pass = matcher.canEnter(bound, top, @intCast(min_len));
+            if (collect_stats) {
+                const st = &self.stats;
+                if (c.internal) st.internal_seen += 1 else st.leaves_seen += 1;
+                if (!pass) {
+                    if (c.internal) st.internal_pruned += 1 else st.leaves_pruned += 1;
+                    st.bytes_pruned += lbl.len;
+                } else if (c.internal) st.internal_bytes_fed += lbl.len else st.leaf_bytes_fed += lbl.len;
+            }
+            if (!pass) continue;
 
             // The children block is read after the feed; start loading it
             if (c.internal) {
@@ -851,7 +890,7 @@ pub const Trie = struct {
             if (c.internal) {
                 try self.fuzzyWalk(L, c, matcher, &childState, path, top, allocator, includeDirs);
             } else {
-                try consider(L, matcher, &childState, path.items, top, allocator, includeDirs);
+                try self.consider(L, matcher, &childState, path.items, top, allocator, includeDirs);
             }
         }
     }

@@ -88,6 +88,13 @@ fn queryLoop() !void {
         // Microsecond resolution: many queries take a few milliseconds (scripts/bench.sh reads this)
         const micros: u64 = @intCast(startTime.durationTo(endTime).toMicroseconds());
         std.debug.print("{d} matches in {d}.{d:0>3}ms\n", .{ searchResult.len, micros / 1000, micros % 1000 });
+        if (trie.collect_stats) {
+            const s = index.trie.stats;
+            std.debug.print(
+                "stats: internal {d} seen {d} pruned, leaves {d} seen {d} pruned, bytes fed {d} internal {d} leaf, {d} pruned, finals {d} seen {d} scored {d} kept\n",
+                .{ s.internal_seen, s.internal_pruned, s.leaves_seen, s.leaves_pruned, s.internal_bytes_fed, s.leaf_bytes_fed, s.bytes_pruned, s.finals_seen, s.finals_scored, s.finals_kept },
+            );
+        }
         for (searchResult) |result| {
             std.debug.print("{d} {s}\n", .{ result.score, result.path });
         }

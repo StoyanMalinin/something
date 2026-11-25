@@ -454,6 +454,16 @@ pub const Matcher = struct {
         return bound + self.config.filename_bonus >= t;
     }
 
+    /// `canReach` with ties counted: whether a subtree with this bound, all of
+    /// whose words are at least `min_tiebreak` long, can still get into `top`
+    /// (a `TopK` ranking ties by shorter tiebreak first). When the best it can
+    /// do is tie the last entry, it gets in only with a shorter word, so a
+    /// subtree already that long is out. That matters when many paths reach the
+    /// best score, as for a one-letter query.
+    pub fn canEnter(self: *const Matcher, bound: i32, top: anytype, min_tiebreak: u32) bool {
+        return top.accepts(bound + self.config.filename_bonus, min_tiebreak);
+    }
+
     fn fold(self: *const Matcher, c: u8) u8 {
         return self.fold_table[c];
     }

@@ -40,6 +40,12 @@ pub fn build(b: *std.Build) void {
     c_mod.linkFramework("CoreServices", .{});
     exe_mod.addImport("c", c_mod);
 
+    // Search counters (children visited and pruned, bytes fed, finals scored), printed
+    // after every query. Off by default: they cost a little in the hot loop.
+    const options = b.addOptions();
+    options.addOption(bool, "stats", b.option(bool, "stats", "Count and print search work per query") orelse false);
+    exe_mod.addOptions("build_options", options);
+
     // This creates another `std.Build.Step.Compile`, but this one builds an executable
     // rather than a static library.
     const exe = b.addExecutable(.{
