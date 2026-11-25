@@ -132,6 +132,14 @@ pub fn main(init: std.process.Init) !void {
         allCnt,
         ratio,
     });
+    var childHist: [257]usize = undefined;
+    index.trie.scanChildCounts(&childHist);
+    std.debug.print("Children per node (count: nodes):\n", .{});
+    for (childHist, 0..) |n, k| {
+        if (n == 0) continue;
+        const plus: []const u8 = if (k == childHist.len - 1) "+" else "";
+        std.debug.print("  {d}{s}: {d}\n", .{ k, plus, n });
+    }
     std.debug.print("Total chars used are {d}\n", .{index.trie.scanTotalCharCount()});
     std.debug.print("Total direct data used for nodes {d}\n", .{index.trie.scanSize()});
 

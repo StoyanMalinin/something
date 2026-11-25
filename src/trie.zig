@@ -1,14 +1,24 @@
-//! A compressed trie of paths, stored as one array of nodes linked by index.
+//! A compressed trie of paths, stored as arrays of node headers linked by index.
 //!
-//! Every node holds the label of the edge into it, its first child and its
-//! next sibling, so a child is one 24-byte entry (no separate edge object,
-//! no pointers). Nodes and label bytes live in two buffers reserved once at
-//! the largest size allowed; the OS backs their pages only as they are used,
-//! and since they never move, an `Index` stays valid as long as its node is
-//! in the trie (positions are held across inserts by the walker threads).
+//! Every node has a header: the label of the edge into it and its mask. A
+//! node that can have children (an internal node) also has `kids`, a
+//! reference to them, and lives in `internals`; a node that can't (a leaf)
+//! lives in `leaves` without it, 16 bytes instead of 20. The kind is a bit of
+//! the `Index`. Directories (words ending in '/') and nodes made by a split
+//! are internal from the start; everything else starts as a leaf and is moved
+//! to `internals` when it gets its first child (a file whose name another
+//! name extends, like "foo" and then "foo.bak"). That is the only time a
+//! node's `Index` changes, so the positions held across inserts by the
+//! walker threads, which are all directories, stay valid.
 //!
-//! Removed nodes are reused through a free list. Removed label bytes are not
-//! reused; `dead_label_bytes` counts them.
+//! A single child is stored in `kids` itself; two or more live in a
+//! contiguous block of child indices from a per-size-class pool (2, 4, ...,
+//! 256 slots; a node has at most 256 children, one per first byte).
+//!
+//! Headers, label bytes and each pool live in buffers reserved once at the
+//! largest size allowed; the OS backs their pages only as they are used.
+//! Removed nodes and blocks are reused through free lists. Removed label
+//! bytes are not reused; `dead_label_bytes` counts them.
 
 const std = @import("std");
 const fuzzy = @import("fuzzy.zig");
@@ -19,6 +29,14 @@ pub const Index = enum(u32) {
     _,
 };
 
+/// Set in the `Index` of a node in `leaves`.
+const leaf_bit: u32 = 1 << 30;
+
+pub fn isLeaf(i: Index) bool {
+    return i != .none and @intFromEnum(i) & leaf_bit != 0;
+}
+
+/// What every node has, leaf or internal.
 pub const Node = struct {
     /// The byte classes (`fuzzy.byteBit`) of this node's label and of
     /// everything below, so a search can bound the best score in a subtree
@@ -31,11 +49,9 @@ pub const Node = struct {
     /// the masks right from the node they are called on down; the nodes above
     /// it are left stale. Changes made from the root are complete. After
     /// changes below a deeper position, call `refreshMasks` from the root.
-    sub: u64,
-    first_child: Index,
-    /// Also links the free list.
-    next_sibling: Index,
-    /// The label of the edge into this node, in `Trie.labels`.
+    sub: u64 align(4),
+    /// The label of the edge into this node, in `Trie.labels`. A free leaf
+    /// links the free list through it.
     label_off: u32,
     label_len: u16,
     /// The label's first byte, so looking up a child doesn't touch the labels.
@@ -43,52 +59,127 @@ pub const Node = struct {
     is_final: bool,
 };
 
+const Internal = struct {
+    node: Node,
+    /// The children (see `Kids`). Also links the free list.
+    kids: u32,
+};
+
 comptime {
-    std.debug.assert(@sizeOf(Node) == 24);
+    std.debug.assert(@sizeOf(Node) == 16);
+    std.debug.assert(@sizeOf(Internal) == 20);
 }
 
-/// The most nodes and label bytes a trie can hold. Reserved up front, so
-/// the defaults cost address space, not memory.
+/// How `Internal.kids` encodes the children:
+/// - `none`: no children
+/// - top bit clear: exactly one child, whose `Index` this is
+/// - top bit set: a block of `class_cap(class)` slots in `pools[class]`, the
+///   children first and `.none` after them. Blocks hold two or more children.
+const Kids = struct {
+    const none: u32 = std.math.maxInt(u32);
+    const array_bit: u32 = 1 << 31;
+    const block_bits = 28;
+    const block_mask: u32 = (1 << block_bits) - 1;
+
+    fn isArray(k: u32) bool {
+        return k != none and k & array_bit != 0;
+    }
+    fn class(k: u32) u3 {
+        return @intCast((k >> block_bits) & 7);
+    }
+    fn make(c: u3, block: u32) u32 {
+        return array_bit | (@as(u32, c) << block_bits) | block;
+    }
+};
+
+const n_classes = 8;
+
+fn classCap(c: u3) u32 {
+    return @as(u32, 2) << c;
+}
+
+/// Fixed-size blocks of child indices for one size class: bump allocated,
+/// with freed blocks reused first (the first slot links them).
+const Pool = struct {
+    slots: []Index,
+    used_blocks: u32 = 0,
+    free: u32 = Kids.none,
+};
+
+/// The most nodes (leaves and internal together) and label bytes a trie can
+/// hold. Reserved up front, so the defaults cost address space, not memory.
 pub const Limits = struct {
-    max_nodes: u32 = 1 << 26, // 1.5 GiB of address space
+    max_nodes: u32 = 1 << 26, // 2.25 GiB of address space for the headers
     max_label_bytes: u32 = 1 << 30,
 };
 
 pub const Trie = struct {
     allocator: std.mem.Allocator,
-    nodes: []Node,
+    leaves: []Node,
+    internals: []Internal,
+    /// Header slots handed out, leaves and internal together (some may be
+    /// free again); bounded by `Limits.max_nodes`.
     node_count: u32,
-    free_nodes: Index = .none,
+    leaf_count: u32 = 0,
+    internal_count: u32,
+    free_leaves: Index = .none,
+    free_internals: Index = .none,
     free_count: u32 = 0,
     labels: []u8,
     labels_used: u32 = 0,
     dead_label_bytes: u32 = 0,
+    pools: [n_classes]Pool,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) !Trie {
-        const nodes = try allocator.alloc(Node, limits.max_nodes);
-        errdefer allocator.free(nodes);
+        const leaves = try allocator.alloc(Node, limits.max_nodes);
+        errdefer allocator.free(leaves);
+        const internals = try allocator.alloc(Internal, limits.max_nodes);
+        errdefer allocator.free(internals);
         const labels = try allocator.alloc(u8, limits.max_label_bytes);
+        errdefer allocator.free(labels);
 
-        nodes[0] = .{
-            .sub = 0,
-            .first_child = .none,
-            .next_sibling = .none,
-            .label_off = 0,
-            .label_len = 0,
-            .first_byte = 0,
-            .is_final = false,
+        // Every child sits in at most one block, and a block is at least half
+        // full when it is made, so twice the node count is enough per class
+        var pools: [n_classes]Pool = undefined;
+        var made: usize = 0;
+        errdefer for (pools[0..made]) |p| allocator.free(p.slots);
+        for (&pools) |*p| {
+            p.* = .{ .slots = try allocator.alloc(Index, @as(usize, limits.max_nodes) * 2) };
+            made += 1;
+        }
+
+        internals[0] = .{
+            .node = .{ .sub = 0, .label_off = 0, .label_len = 0, .first_byte = 0, .is_final = false },
+            .kids = Kids.none,
         };
-        return .{ .allocator = allocator, .nodes = nodes, .node_count = 1, .labels = labels };
+        return .{
+            .allocator = allocator,
+            .leaves = leaves,
+            .internals = internals,
+            .node_count = 1,
+            .internal_count = 1,
+            .labels = labels,
+            .pools = pools,
+        };
     }
 
     pub fn deinit(self: *Trie) void {
-        self.allocator.free(self.nodes);
+        self.allocator.free(self.leaves);
+        self.allocator.free(self.internals);
         self.allocator.free(self.labels);
+        for (self.pools) |p| self.allocator.free(p.slots);
         self.* = undefined;
     }
 
     fn at(self: *Trie, i: Index) *Node {
-        return &self.nodes[@intFromEnum(i)];
+        const v = @intFromEnum(i);
+        if (v & leaf_bit != 0) return &self.leaves[v & ~leaf_bit];
+        return &self.internals[v].node;
+    }
+
+    fn kidsOf(self: *Trie, i: Index) *u32 {
+        std.debug.assert(!isLeaf(i));
+        return &self.internals[@intFromEnum(i)].kids;
     }
 
     fn label(self: *Trie, i: Index) []const u8 {
@@ -102,116 +193,213 @@ pub const Trie = struct {
 
     // ------------------------------------------------------------ storage
 
-    fn newNode(self: *Trie, label_off: u32, label_len: u16) error{OutOfMemory}!Index {
-        const i: Index = if (self.free_nodes != .none) blk: {
-            const reused = self.free_nodes;
-            self.free_nodes = self.at(reused).next_sibling;
-            self.free_count -= 1;
+    fn block(self: *Trie, k: u32) []Index {
+        const c = Kids.class(k);
+        const cap = classCap(c);
+        return self.pools[c].slots[(k & Kids.block_mask) * cap ..][0..cap];
+    }
+
+    fn allocBlock(self: *Trie, c: u3) error{OutOfMemory}!u32 {
+        const p = &self.pools[c];
+        const cap = classCap(c);
+        const b: u32 = if (p.free != Kids.none) blk: {
+            const reused = p.free;
+            p.free = @intFromEnum(p.slots[reused * cap]);
             break :blk reused;
         } else blk: {
-            if (self.node_count == self.nodes.len) return error.OutOfMemory;
-            self.node_count += 1;
-            break :blk @enumFromInt(self.node_count - 1);
+            if ((@as(usize, p.used_blocks) + 1) * cap > p.slots.len) return error.OutOfMemory;
+            p.used_blocks += 1;
+            break :blk p.used_blocks - 1;
         };
+        const k = Kids.make(c, b);
+        @memset(self.block(k), .none);
+        return k;
+    }
+
+    fn freeBlock(self: *Trie, k: u32) void {
+        const p = &self.pools[Kids.class(k)];
+        self.block(k)[0] = @enumFromInt(p.free);
+        p.free = k & Kids.block_mask;
+    }
+
+    /// `i`'s children, in place: writing to the slice changes them.
+    fn children(self: *Trie, i: Index) []Index {
+        if (isLeaf(i)) return &.{};
+        const k = self.kidsOf(i);
+        if (k.* == Kids.none) return &.{};
+        if (!Kids.isArray(k.*)) return @as([*]Index, @ptrCast(k))[0..1];
+        const blk = self.block(k.*);
+        return blk[0 .. std.mem.indexOfScalar(Index, blk, .none) orelse blk.len];
+    }
+
+    /// Drops `i`'s children (not freeing them) and their block.
+    fn releaseKids(self: *Trie, i: Index) void {
+        if (isLeaf(i)) return;
+        const k = self.kidsOf(i);
+        if (Kids.isArray(k.*)) self.freeBlock(k.*);
+        k.* = Kids.none;
+    }
+
+    /// A header slot of the given kind, its contents undefined.
+    fn allocSlot(self: *Trie, leaf: bool) error{OutOfMemory}!Index {
+        if (leaf and self.free_leaves != .none) {
+            const reused = self.free_leaves;
+            self.free_leaves = @enumFromInt(self.at(reused).label_off);
+            self.free_count -= 1;
+            return reused;
+        }
+        if (!leaf and self.free_internals != .none) {
+            const reused = self.free_internals;
+            self.free_internals = @enumFromInt(self.kidsOf(reused).*);
+            self.free_count -= 1;
+            return reused;
+        }
+        if (self.node_count == self.leaves.len) return error.OutOfMemory;
+        self.node_count += 1;
+        if (leaf) {
+            self.leaf_count += 1;
+            return @enumFromInt(leaf_bit | (self.leaf_count - 1));
+        }
+        self.internal_count += 1;
+        return @enumFromInt(self.internal_count - 1);
+    }
+
+    /// Puts `i`'s slot on its free list. `i` must have no children.
+    fn releaseSlot(self: *Trie, i: Index) void {
+        std.debug.assert(i != .root);
+        if (isLeaf(i)) {
+            self.at(i).label_off = @intFromEnum(self.free_leaves);
+            self.free_leaves = i;
+        } else {
+            std.debug.assert(self.kidsOf(i).* == Kids.none);
+            self.kidsOf(i).* = @intFromEnum(self.free_internals);
+            self.free_internals = i;
+        }
+        self.free_count += 1;
+    }
+
+    fn newNode(self: *Trie, leaf: bool, label_off: u32, label_len: u16) error{OutOfMemory}!Index {
+        const i = try self.allocSlot(leaf);
         self.at(i).* = .{
             .sub = 0,
-            .first_child = .none,
-            .next_sibling = .none,
             .label_off = label_off,
             .label_len = label_len,
             .first_byte = self.labels[label_off],
             .is_final = false,
         };
+        if (!leaf) self.kidsOf(i).* = Kids.none;
         return i;
     }
 
-    /// A new node with a copy of `bytes` as its label.
-    fn newLeaf(self: *Trie, bytes: []const u8) error{ OutOfMemory, NameTooLong }!Index {
+    /// A new childless node with a copy of `bytes`, the end of a word, as its
+    /// label: internal if the word is a directory, else a leaf.
+    fn newEnd(self: *Trie, bytes: []const u8) error{ OutOfMemory, NameTooLong }!Index {
         const len = std.math.cast(u16, bytes.len) orelse return error.NameTooLong;
         if (self.labels.len - self.labels_used < len) return error.OutOfMemory;
         const off = self.labels_used;
         @memcpy(self.labels[off..][0..len], bytes);
-        self.labels_used += len;
 
-        const i = try self.newNode(off, len);
+        const i = try self.newNode(bytes[bytes.len - 1] != '/', off, len);
+        self.labels_used += len;
         self.at(i).sub = fuzzy.labelMask(bytes);
         return i;
     }
 
     fn freeNode(self: *Trie, i: Index) void {
-        std.debug.assert(i != .root);
-        const n = self.at(i);
-        self.dead_label_bytes += n.label_len;
-        n.first_child = .none;
-        n.next_sibling = self.free_nodes;
-        self.free_nodes = i;
-        self.free_count += 1;
+        self.dead_label_bytes += self.at(i).label_len;
+        self.releaseSlot(i);
+    }
+
+    /// Moves leaf `i`, a child of `parent`, to `internals` so it can take
+    /// children, and returns its new index.
+    fn promote(self: *Trie, parent: Index, i: Index) error{OutOfMemory}!Index {
+        const n = try self.allocSlot(false);
+        self.at(n).* = self.at(i).*;
+        self.kidsOf(n).* = Kids.none;
+        self.replaceChild(parent, i, n);
+        self.releaseSlot(i);
+        return n;
     }
 
     /// Frees `i` and everything below it. `i` must not be linked into the trie.
     pub fn freeSubtree(self: *Trie, i: Index) void {
-        var c = self.at(i).first_child;
-        while (c != .none) {
-            const next = self.at(c).next_sibling;
-            self.freeSubtree(c);
-            c = next;
-        }
+        for (self.children(i)) |c| self.freeSubtree(c);
+        self.releaseKids(i);
         self.freeNode(i);
     }
 
     // ---------------------------------------------------------- structure
 
     fn findChild(self: *Trie, parent: Index, first: u8) Index {
-        var c = self.at(parent).first_child;
-        while (c != .none) : (c = self.at(c).next_sibling) {
+        for (self.children(parent)) |c| {
             if (self.at(c).first_byte == first) return c;
         }
         return .none;
     }
 
-    fn prependChild(self: *Trie, parent: Index, child: Index) void {
-        self.at(child).next_sibling = self.at(parent).first_child;
-        self.at(parent).first_child = child;
+    fn appendChild(self: *Trie, parent: Index, child: Index) error{OutOfMemory}!void {
+        const kp = self.kidsOf(parent);
+        const k = kp.*;
+        if (k == Kids.none) {
+            kp.* = @intFromEnum(child);
+            return;
+        }
+        if (!Kids.isArray(k)) {
+            const nk = try self.allocBlock(0);
+            const blk = self.block(nk);
+            blk[0] = @enumFromInt(k);
+            blk[1] = child;
+            kp.* = nk;
+            return;
+        }
+        const blk = self.block(k);
+        if (std.mem.indexOfScalar(Index, blk, .none)) |n| {
+            blk[n] = child;
+            return;
+        }
+        // Full: move up a class. 256 children (one per byte) fill the last one
+        const nk = try self.allocBlock(Kids.class(k) + 1);
+        const nb = self.block(nk);
+        @memcpy(nb[0..blk.len], blk);
+        nb[blk.len] = child;
+        self.freeBlock(k);
+        kp.* = nk;
     }
 
     /// Puts `replacement` where `old` is in `parent`'s children.
     fn replaceChild(self: *Trie, parent: Index, old: Index, replacement: Index) void {
-        self.at(replacement).next_sibling = self.at(old).next_sibling;
-        self.at(old).next_sibling = .none;
-
-        const p = self.at(parent);
-        if (p.first_child == old) {
-            p.first_child = replacement;
-            return;
-        }
-        var c = p.first_child;
-        while (self.at(c).next_sibling != old) c = self.at(c).next_sibling;
-        self.at(c).next_sibling = replacement;
+        const cs = self.children(parent);
+        cs[std.mem.indexOfScalar(Index, cs, old).?] = replacement;
     }
 
     fn unlinkChild(self: *Trie, parent: Index, child: Index) void {
-        const p = self.at(parent);
-        if (p.first_child == child) {
-            p.first_child = self.at(child).next_sibling;
-        } else {
-            var c = p.first_child;
-            while (self.at(c).next_sibling != child) c = self.at(c).next_sibling;
-            self.at(c).next_sibling = self.at(child).next_sibling;
+        const cs = self.children(parent);
+        const pos = std.mem.indexOfScalar(Index, cs, child).?;
+        if (cs.len == 1) {
+            self.kidsOf(parent).* = Kids.none;
+            return;
         }
-        self.at(child).next_sibling = .none;
+        std.mem.copyForwards(Index, cs[pos..], cs[pos + 1 ..]);
+        cs[cs.len - 1] = .none;
+        // Blocks hold two or more; a lone child goes back into `kids`
+        if (cs.len == 2) {
+            const only = cs[0];
+            self.releaseKids(parent);
+            self.kidsOf(parent).* = @intFromEnum(only);
+        }
     }
 
-    /// Splits `child`'s label after `len` bytes: a new node takes the first
-    /// part and `child`'s place under `parent`, and `child` keeps the rest
-    /// (and its index, so positions held on it stay valid).
+    /// Splits `child`'s label after `len` bytes: a new internal node takes
+    /// the first part and `child`'s place under `parent`, and `child` keeps
+    /// the rest (and its index, so positions held on it stay valid).
     fn splitAbove(self: *Trie, parent: Index, child: Index, len: u16) error{OutOfMemory}!Index {
+        const mid = try self.newNode(false, self.at(child).label_off, len);
         const c = self.at(child);
-        const mid = try self.newNode(c.label_off, len);
         // Covers both halves of the label and everything below. The lower node
         // keeps its mask too, which still covers its (now shorter) label.
         self.at(mid).sub = c.sub;
         self.replaceChild(parent, child, mid);
-        self.at(mid).first_child = child;
+        self.kidsOf(mid).* = @intFromEnum(child);
 
         c.label_off += len;
         c.label_len -= len;
@@ -219,20 +407,32 @@ pub const Trie = struct {
         return mid;
     }
 
-    /// Adds `word` below `from` and returns the node it ends at.
+    /// Adds `word` below `from` and returns the node it ends at. `from` must
+    /// be internal: the root, a directory or a node a split made.
+    ///
+    /// Indices stay valid except for a leaf that `word` passes through and
+    /// that is not final for it: one whose word `word` extends (a file "foo"
+    /// when adding "foo.bak"). It moves to `internals` under a new index.
     pub fn add(self: *Trie, from: Index, word: []const u8) error{ OutOfMemory, NameTooLong }!Index {
         std.debug.assert(word.len > 0);
+        std.debug.assert(!isLeaf(from));
+        var parent: Index = .none;
         var cur = from;
         var rest = word;
         while (true) {
             const child = self.findChild(cur, rest[0]);
             if (child == .none) {
-                const leaf = try self.newLeaf(rest);
-                self.at(leaf).is_final = true;
-                self.prependChild(cur, leaf);
+                // Never `from`, which is internal, so its parent is known
+                if (isLeaf(cur)) cur = try self.promote(parent, cur);
+                const end = try self.newEnd(rest);
+                self.at(end).is_final = true;
+                self.appendChild(cur, end) catch |err| {
+                    self.freeNode(end);
+                    return err;
+                };
                 // Every node on the way down from `from` now has these below
-                self.widenAlong(from, word, self.at(leaf).sub);
-                return leaf;
+                self.widenAlong(from, word, self.at(end).sub);
+                return end;
             }
 
             const lbl = self.label(child);
@@ -242,6 +442,7 @@ pub const Trie = struct {
                     self.at(child).is_final = true;
                     return child;
                 }
+                parent = cur;
                 cur = child;
                 rest = rest[common..];
                 continue;
@@ -253,6 +454,7 @@ pub const Trie = struct {
                 self.at(mid).is_final = true;
                 return mid;
             }
+            parent = cur;
             cur = mid;
             rest = rest[common..];
         }
@@ -296,25 +498,19 @@ pub const Trie = struct {
     /// Widens `to`'s mask, not its ancestors' (see `Node.sub`): returns the
     /// children's byte classes, for `widenAlong` from above.
     pub fn adoptChildren(self: *Trie, to: Index, other: Index) u64 {
-        var c = self.at(to).first_child;
-        while (c != .none) {
-            const next = self.at(c).next_sibling;
-            self.freeSubtree(c);
-            c = next;
-        }
-        self.at(to).first_child = self.at(other).first_child;
-        self.at(other).first_child = .none;
+        for (self.children(to)) |c| self.freeSubtree(c);
+        self.releaseKids(to);
+        self.kidsOf(to).* = self.kidsOf(other).*;
+        self.kidsOf(other).* = Kids.none;
 
         var below: u64 = 0;
-        c = self.at(to).first_child;
-        while (c != .none) : (c = self.at(c).next_sibling) below |= self.at(c).sub;
+        for (self.children(to)) |c| below |= self.at(c).sub;
         self.at(to).sub |= below;
         return below;
     }
 
     /// Frees a node unlinked by `removeRecursive` whose children were adopted.
     pub fn freeEmptied(self: *Trie, i: Index) void {
-        std.debug.assert(self.at(i).first_child == .none);
         self.freeNode(i);
     }
 
@@ -341,8 +537,7 @@ pub const Trie = struct {
     /// what `i`'s mask needs to cover from below.
     pub fn recomputeMasks(self: *Trie, i: Index) u64 {
         var below: u64 = 0;
-        var c = self.at(i).first_child;
-        while (c != .none) : (c = self.at(c).next_sibling) {
+        for (self.children(i)) |c| {
             const sub = fuzzy.labelMask(self.label(c)) | self.recomputeMasks(c);
             self.at(c).sub = sub;
             below |= sub;
@@ -364,14 +559,23 @@ pub const Trie = struct {
     }
 
     fn passthroughBelow(self: *Trie, i: Index) usize {
+        const cs = self.children(i);
         var cnt: usize = 0;
-        var children: usize = 0;
-        var c = self.at(i).first_child;
-        while (c != .none) : (c = self.at(c).next_sibling) {
-            children += 1;
-            cnt += self.passthroughBelow(c);
-        }
-        return cnt + @intFromBool(children == 1);
+        for (cs) |c| cnt += self.passthroughBelow(c);
+        return cnt + @intFromBool(cs.len == 1);
+    }
+
+    /// `hist[k]` counts nodes with exactly `k` children; the last bucket
+    /// collects everything at or above it.
+    pub fn scanChildCounts(self: *Trie, hist: []usize) void {
+        @memset(hist, 0);
+        self.childCountsBelow(.root, hist);
+    }
+
+    fn childCountsBelow(self: *Trie, i: Index, hist: []usize) void {
+        const cs = self.children(i);
+        for (cs) |c| self.childCountsBelow(c, hist);
+        hist[@min(cs.len, hist.len - 1)] += 1;
     }
 
     /// Label bytes in use (not counting removed ones).
@@ -381,7 +585,16 @@ pub const Trie = struct {
 
     /// Bytes of nodes and labels in use, including freed ones not yet reused.
     pub fn scanSize(self: *Trie) usize {
-        return @as(usize, self.node_count) * @sizeOf(Node) + self.labels_used;
+        return @as(usize, self.leaf_count) * @sizeOf(Node) +
+            @as(usize, self.internal_count) * @sizeOf(Internal) +
+            self.labels_used + self.scanBlockBytes();
+    }
+
+    /// Bytes of child blocks handed out, including freed ones not yet reused.
+    pub fn scanBlockBytes(self: *Trie) usize {
+        var total: usize = 0;
+        for (self.pools, 0..) |p, c| total += @as(usize, p.used_blocks) * classCap(@intCast(c)) * @sizeOf(Index);
+        return total;
     }
 
     pub fn scanAllNodes(self: *Trie) usize {
@@ -394,8 +607,7 @@ pub const Trie = struct {
 
     fn finalsBelow(self: *Trie, i: Index) usize {
         var cnt: usize = @intFromBool(self.at(i).is_final);
-        var c = self.at(i).first_child;
-        while (c != .none) : (c = self.at(c).next_sibling) cnt += self.finalsBelow(c);
+        for (self.children(i)) |c| cnt += self.finalsBelow(c);
         return cnt;
     }
 
@@ -405,8 +617,7 @@ pub const Trie = struct {
     }
 
     fn masksConsistentBelow(self: *Trie, i: Index) bool {
-        var c = self.at(i).first_child;
-        while (c != .none) : (c = self.at(c).next_sibling) {
+        for (self.children(i)) |c| {
             const need = fuzzy.labelMask(self.label(c));
             if (self.at(c).sub & need != need) return false;
             if (self.at(i).sub & self.at(c).sub != self.at(c).sub) return false;
@@ -437,8 +648,7 @@ pub const Trie = struct {
         if (matchLen == word.len) return self.finalsBelow(i);
 
         var cnt: usize = 0;
-        var c = self.at(i).first_child;
-        while (c != .none) : (c = self.at(c).next_sibling) {
+        for (self.children(i)) |c| {
             var m = matchLen;
             for (self.label(c)) |ch| {
                 while (m > 0 and ch != word[m]) m = f[m - 1];
@@ -509,20 +719,27 @@ pub const Trie = struct {
             }
         }
 
-        var c = self.at(i).first_child;
-        while (c != .none) : (c = self.at(c).next_sibling) {
+        // The children's headers are rarely adjacent in memory, but their
+        // indices are all known here, so start every load at once
+        const cs = self.children(i);
+        for (cs) |c| @prefetch(self.at(c), .{});
+
+        for (cs) |c| {
             const node = self.at(c);
-            // Siblings are rarely adjacent in memory and the chain can't be
-            // followed ahead, so start the next node's load while this one is
-            // checked (and walked, if it passes)
-            if (node.next_sibling != .none) @prefetch(self.at(node.next_sibling), .{});
 
             // Skip subtrees whose best possible score can't produce a result
             const bound = matcher.subtreeBound(state, node.sub);
             if (!matcher.canReach(bound, top.threshold())) continue;
 
-            // Likewise the first child, which the walk visits after the feed
-            if (node.first_child != .none) @prefetch(self.at(node.first_child), .{});
+            // Likewise where the children are, which the walk reads after the feed
+            if (!isLeaf(c)) {
+                const k = self.kidsOf(c).*;
+                if (Kids.isArray(k)) {
+                    @prefetch(self.block(k).ptr, .{});
+                } else if (k != Kids.none) {
+                    @prefetch(self.at(@enumFromInt(k)), .{});
+                }
+            }
             const lbl = self.label(c);
             var childState = state.*;
             matcher.feed(&childState, lbl);
@@ -605,16 +822,45 @@ test "add with chaining" {
     var t = try testTrie();
     defer t.deinit();
 
-    const he = try t.add(.root, "he");
+    const he = try t.add(.root, "he/");
     _ = try t.add(he, "llo");
-    const hero = try t.add(he, "ro");
+    const hero = try t.add(he, "ro/");
     _ = try t.add(hero, "ic");
 
     try testing.expectEqual(4, try t.query("h"));
     try testing.expectEqual(3, try t.query("o"));
-    try testing.expectEqual(1, try t.query("hello"));
-    try testing.expectEqual(2, try t.query("hero"));
-    try testing.expectEqual(1, try t.query("heroic"));
+    try testing.expectEqual(1, try t.query("he/llo"));
+    try testing.expectEqual(2, try t.query("he/ro/"));
+    try testing.expectEqual(1, try t.query("he/ro/ic"));
+}
+
+test "directories and split nodes are internal, other words start as leaves" {
+    var t = try testTrie();
+    defer t.deinit();
+
+    const dir = try t.add(.root, "d/");
+    const file = try t.add(dir, "foo");
+    try testing.expect(!isLeaf(dir));
+    try testing.expect(isLeaf(file));
+
+    // "foo.bak" extends "foo": the leaf moves to `internals`, keeping its word
+    const bak = try t.add(dir, "foo.bak");
+    try testing.expect(isLeaf(bak));
+    const moved = t.lookup(.root, "d/foo").?.node;
+    try testing.expect(moved != file and !isLeaf(moved));
+    try testing.expect(t.isFinal(moved));
+    // The old leaf slot went straight back into use for ".bak"
+    try testing.expectEqual(file, bak);
+    try testing.expectEqual(4, t.scanAllNodes()); // root, d/, foo, .bak
+    try testing.expectEqual(2, try t.query("foo"));
+
+    // A split puts an internal node above the leaf, which keeps its index
+    const fob = try t.add(dir, "fob");
+    try testing.expect(!isLeaf(t.lookup(.root, "d/fo").?.node));
+    try testing.expectEqual(bak, t.lookup(.root, "d/foo.bak").?.node);
+    try testing.expectEqual(fob, t.lookup(.root, "d/fob").?.node);
+    t.refreshMasks(.root, "d/", dir);
+    try testing.expect(t.masksAreConsistent());
 }
 
 test "a split keeps the index of the node below it" {
@@ -746,4 +992,29 @@ test "running out of room is an error, not a crash" {
     try testing.expectError(error.OutOfMemory, t.add(.root, "xxxxxx"));
     _ = try t.add(.root, "ab"); // a split, no new label bytes
     try testing.expectError(error.OutOfMemory, t.add(.root, "q"));
+}
+
+test "children grow through every block class and shrink back" {
+    var t = try testTrie();
+    defer t.deinit();
+
+    var buf: [2]u8 = .{ 'p', 0 };
+    for (0..256) |b| {
+        buf[1] = @intCast(b);
+        _ = try t.add(.root, &buf);
+    }
+    const p = t.findChild(.root, 'p');
+    try testing.expectEqual(256, t.children(p).len);
+    try testing.expectEqual(7, Kids.class(t.kidsOf(p).*));
+    try testing.expect(t.masksAreConsistent());
+
+    for (0..255) |b| {
+        buf[1] = @intCast(b);
+        t.freeSubtree(t.removeRecursive(.root, &buf).?);
+    }
+    // One child left: back in `kids` itself, its block returned
+    try testing.expect(!Kids.isArray(t.kidsOf(p).*));
+    try testing.expectEqual(1, t.children(p).len);
+    try testing.expectEqual(1, try t.query("p\xff"));
+    try testing.expect(t.pools[7].free != Kids.none);
 }

@@ -52,6 +52,10 @@ pub const FileIndex = struct {
 
     /// Adding below a position other than the root leaves the search masks
     /// above that position stale: call `refreshMasks` once done (see `trie.Trie.sub`).
+    ///
+    /// `position` must be the root or a folder's. A folder's position stays
+    /// valid until it is removed; a file's can change when a later name
+    /// extends it ("foo", then "foo.bak"; see `trie.Trie.add`).
     pub fn addFileName(self: *FileIndex, position: Position, name: []const u8, isDir: bool) !Position {
         var buf: KeyBuf = undefined;
         const key = try entryKey(name, isDir, &buf);
