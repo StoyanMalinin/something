@@ -21,7 +21,11 @@
 //! different byte, or be dropped altogether, each at a penalty, in the same
 //! DP: no extra state, just more transitions. There is no limit on them and
 //! no cutoff: every non-empty candidate gets a score, and typos only push it
-//! down the ranking.
+//! down the ranking. One exception: between two matched query bytes, at most
+//! one query byte can be dropped (any number can be at the start or the end).
+//! Allowing more costs a full prefix max per candidate byte, which is the
+//! critical path of the DP, and rarely changes the ranking: two drops in a
+//! row already cost more than most matches earn.
 //!
 //! Case handling is "smart case": an all-lowercase query matches
 //! case-insensitively, a query with any uppercase letter matches exactly.
@@ -102,16 +106,14 @@ pub fn StateOf(comptime L: usize) type {
     return struct {
         pub const lanes = L;
 
-        /// Over the whole candidate.
+        /// Over the whole candidate. The filename match (the query matched
+        /// inside the last segment alone) isn't tracked while feeding: `finish`
+        /// rebuilds it from the candidate, which costs a segment's worth of
+        /// steps but only for candidates that get that far.
         full: RowsOf(L) = .{},
-        /// Over the current path segment only.
-        seg: RowsOf(L) = .{},
         prev: u8 = '/',
         /// Candidate bytes fed so far.
         len: u32 = 0,
-        /// A `/` was seen; the segment rows are reset lazily on the next byte so
-        /// that a trailing `/` keeps the previous segment as the filename.
-        seg_reset_pending: bool = false,
     };
 }
 
@@ -120,8 +122,15 @@ pub const State = StateOf(max_query_len);
 
 pub const Matcher = struct {
     query: [max_query_len]u8,
+    /// `byteBit` of each query byte, for `subtreeBound`, which runs once per
+    /// child visited.
+    query_bits: [max_query_len]u64,
     len: usize,
     case_sensitive: bool,
+    /// `lowercase_table` or `identity_table`, per `case_sensitive`.
+    fold_table: *const [256]u8,
+    /// `bonus_kinds` with this config's values filled in.
+    bonus_table: [byte_classes][byte_classes]Score,
     config: Config,
 
     pub fn init(query: []const u8, config: Config) error{QueryTooLong}!Matcher {
@@ -130,18 +139,31 @@ pub const Matcher = struct {
         var self: Matcher = .{
             // Zeros past the end: the vector step compares whole registers
             .query = @splat(0),
+            .query_bits = @splat(0),
             .len = query.len,
             .case_sensitive = false,
+            .fold_table = &lowercase_table,
+            .bonus_table = undefined,
             .config = config,
         };
         for (query) |c| {
             if (std.ascii.isUpper(c)) {
                 self.case_sensitive = true;
+                self.fold_table = &identity_table;
                 break;
             }
         }
+        for (&self.bonus_table, bonus_kinds) |*row, kinds| {
+            for (row, kinds) |*b, kind| b.* = switch (kind) {
+                .none => 0,
+                .path_boundary => config.bonus_path_boundary,
+                .boundary => config.bonus_boundary,
+                .camel => config.bonus_camel,
+            };
+        }
         for (query, 0..) |c, i| {
             self.query[i] = self.fold(c);
+            self.query_bits[i] = byteBit(self.query[i]);
         }
         return self;
     }
@@ -161,33 +183,47 @@ pub const Matcher = struct {
         defer state.prev = c;
         state.len +|= 1;
 
-        if (c == '/') {
-            if (self.len != 0) self.step(&state.full, c, 0, state.len);
-            state.seg_reset_pending = true;
-            return;
-        }
-
-        if (state.seg_reset_pending) {
-            state.seg = .{};
-            state.seg_reset_pending = false;
-        }
-
         if (self.len == 0) return;
-        const b = self.bonus(state.prev, c);
-        self.step(&state.full, c, b, state.len);
-        self.step(&state.seg, c, b, state.len);
+        self.step(&state.full, c, self.bonus(state.prev, c), state.len);
+    }
+
+    /// Upper bound on what `finish` returns for the candidate fed so far, or
+    /// null if `finish` would. Needs no candidate bytes, so a caller can drop
+    /// candidates that can't make it before building them: the filename match
+    /// is a subset of the alignments of the whole candidate, so the most it
+    /// adds is the filename bonus.
+    pub fn finishBound(self: *const Matcher, state: anytype) ?i32 {
+        if (self.len == 0) return 0;
+        if (state.full.done <= NEG) return null;
+        return @as(i32, state.full.done) + self.config.filename_bonus;
     }
 
     /// Score for the candidate fed so far, or null if nothing has been fed
-    /// yet. Higher is better. Does not modify the state, so you can keep feeding.
-    pub fn finish(self: *const Matcher, state: anytype) ?i32 {
+    /// yet. Higher is better. Does not modify the state, so you can keep
+    /// feeding. `candidate` is everything that was fed.
+    pub fn finish(self: *const Matcher, state: anytype, candidate: []const u8) ?i32 {
         if (self.len == 0) return 0;
         if (state.full.done <= NEG) return null;
 
         var s: i32 = state.full.done - self.trailingPenalty(state, &state.full);
-        if (state.seg.done > NEG) {
-            const in_filename = @as(i32, state.seg.done) + self.config.filename_bonus -
-                self.trailingPenalty(state, &state.seg);
+
+        // The filename: the last run of bytes between slashes (so a trailing
+        // `/`, as directories have in the index, doesn't start an empty one)
+        var end = candidate.len;
+        while (end > 0 and candidate[end - 1] == '/') end -= 1;
+        var name_start = end;
+        while (name_start > 0 and candidate[name_start - 1] != '/') name_start -= 1;
+        if (name_start == end) return s;
+
+        var seg: @TypeOf(state.full) = .{};
+        var prev: u8 = '/';
+        for (candidate[name_start..end], name_start..) |c, i| {
+            self.step(&seg, c, self.bonus(prev, c), @intCast(i + 1));
+            prev = c;
+        }
+        if (seg.done > NEG) {
+            const in_filename = @as(i32, seg.done) + self.config.filename_bonus -
+                self.trailingPenalty(state, &seg);
             s = @max(s, in_filename);
         }
         return s;
@@ -213,7 +249,7 @@ pub const Matcher = struct {
     fn scoreL(self: *const Matcher, comptime L: usize, candidate: []const u8) ?i32 {
         var state: StateOf(L) = .{};
         self.feed(&state, candidate);
-        return self.finish(&state);
+        return self.finish(&state, candidate);
     }
 
     /// Upper bound on the `full.done` reachable by feeding more bytes, all
@@ -237,7 +273,7 @@ pub const Matcher = struct {
         var j: usize = n;
         while (j > 0) {
             j -= 1;
-            const match: i32 = if (mask & byteBit(self.query[j]) != 0) exact else typo;
+            const match: i32 = if (mask & self.query_bits[j] != 0) exact else typo;
             const live = @max(state.full.m[j], state.full.g[j]);
             if (live > NEG) best = @max(best, live + suffix);
             const first = match + max_b * cfg.first_char_multiplier - @as(i32, @intCast(j)) * cfg.skip_penalty;
@@ -256,7 +292,7 @@ pub const Matcher = struct {
     }
 
     fn fold(self: *const Matcher, c: u8) u8 {
-        return if (self.case_sensitive) c else std.ascii.toLower(c);
+        return self.fold_table[c];
     }
 
     fn step(self: *const Matcher, rows: anytype, c: u8, b: Score, fed: u32) void {
@@ -284,12 +320,13 @@ pub const Matcher = struct {
         const match_score = @select(Score, exact, @as(V, @splat(cfg.score_match)), @as(V, @splat(cfg.score_match - cfg.typo_penalty)));
 
         // The best alignment of query[0..j-1] to come from: one that ended at
-        // query[i], i < j, followed by dropping query[i+1..j-1]:
-        //   max over i < j of old[i] - (j-1-i) * skip_penalty
-        //   = (max over i < j of old[i] + i * skip_penalty) - (j-1) * skip_penalty
-        // Lane 0 has nothing before it (NEG).
-        const adjacent = maxBefore(L, old_m + j_skip) - j_skip + skip;
-        const gapped = maxBefore(L, old_g + j_skip) - j_skip + skip;
+        // query[i], followed by dropping query[i+1..j-1]. Only i = j-1 and
+        // i = j-2 (one byte dropped) are allowed, see the top of the file:
+        //   max over i in {j-2, j-1} of old[i] - (j-1-i) * skip_penalty
+        //   = (max over i in {j-2, j-1} of old[i] + i * skip_penalty) - (j-1) * skip_penalty
+        // Lane 0 has nothing before it (NEG), lane 1 only lane 0.
+        const adjacent = maxOfPrevTwo(L, old_m + j_skip) - j_skip + skip;
+        const gapped = maxOfPrevTwo(L, old_g + j_skip) - j_skip + skip;
 
         // The best alignment of query[0..=j] ending here is the best of three.
         // One built on "no alignment" (NEG) can never win: `first` is at least
@@ -320,31 +357,92 @@ pub const Matcher = struct {
         }
     }
 
+    /// Bonus for matching `c` right after `prev`. Two table lookups: the rules
+    /// are in `bonusKind`, below.
     fn bonus(self: *const Matcher, prev: u8, c: u8) Score {
-        const cfg = &self.config;
-        if (!std.ascii.isAlphanumeric(c)) return 0;
-        return switch (prev) {
-            '/' => cfg.bonus_path_boundary,
-            ' ', '_', '-', '.' => cfg.bonus_boundary,
-            else => blk: {
-                if (prev < 0x80 and !std.ascii.isAlphanumeric(prev)) break :blk cfg.bonus_boundary;
-                if (std.ascii.isLower(prev) and std.ascii.isUpper(c)) break :blk cfg.bonus_camel;
-                if (!std.ascii.isDigit(prev) and std.ascii.isDigit(c)) break :blk cfg.bonus_camel;
-                break :blk 0;
-            },
-        };
+        return self.bonus_table[@backingInt(byte_class[prev])][@backingInt(byte_class[c])];
     }
 };
 
-/// Lane j: the maximum of lanes 0..j-1 of `v`, or NEG for lane 0. A prefix
-/// maximum in log2(L) shift-and-max steps.
-fn maxBefore(comptime L: usize, v: @Vector(L, Score)) @Vector(L, Score) {
-    var acc = shiftUp(L, v, 1);
-    comptime var k = 1;
-    inline while (k < L) : (k *= 2) {
-        acc = @max(acc, shiftUp(L, acc, k));
+/// What a byte counts as, for the bonus rules.
+const ByteClass = enum(u3) {
+    slash,
+    /// Space, `_`, `-`, `.` and any other ASCII byte that isn't a letter or digit.
+    punct,
+    lower,
+    upper,
+    digit,
+    /// Non-ASCII.
+    other,
+};
+const byte_classes = @typeInfo(ByteClass).@"enum".field_names.len;
+
+fn classify(c: u8) ByteClass {
+    if (c == '/') return .slash;
+    if (std.ascii.isLower(c)) return .lower;
+    if (std.ascii.isUpper(c)) return .upper;
+    if (std.ascii.isDigit(c)) return .digit;
+    if (c < 0x80) return .punct;
+    return .other;
+}
+
+const BonusKind = enum { none, path_boundary, boundary, camel };
+
+/// The bonus rules: what matching a byte of class `c` right after one of
+/// class `prev` earns.
+fn bonusKind(prev: ByteClass, c: ByteClass) BonusKind {
+    // Only letters and digits earn a bonus
+    switch (c) {
+        .lower, .upper, .digit => {},
+        .slash, .punct, .other => return .none,
     }
-    return acc;
+    return switch (prev) {
+        // Also the start of the candidate, as `prev` starts out as `/`
+        .slash => .path_boundary,
+        .punct => .boundary,
+        // camelCase hump, or letter -> digit
+        .lower => if (c == .upper or c == .digit) .camel else .none,
+        // non-digit -> digit
+        .upper, .other => if (c == .digit) .camel else .none,
+        .digit => .none,
+    };
+}
+
+const byte_class: [256]ByteClass = blk: {
+    @setEvalBranchQuota(10_000);
+    var t: [256]ByteClass = undefined;
+    for (&t, 0..) |*e, c| e.* = classify(@intCast(c));
+    break :blk t;
+};
+
+const bonus_kinds: [byte_classes][byte_classes]BonusKind = blk: {
+    var t: [byte_classes][byte_classes]BonusKind = undefined;
+    for (&t, 0..) |*row, prev| {
+        for (row, 0..) |*e, c| e.* = bonusKind(@fromBackingInt(@intCast(prev)), @fromBackingInt(@intCast(c)));
+    }
+    break :blk t;
+};
+
+const identity_table: [256]u8 = blk: {
+    var t: [256]u8 = undefined;
+    for (&t, 0..) |*e, c| e.* = @intCast(c);
+    break :blk t;
+};
+
+/// Smart case's fold for an all-lowercase query: ASCII letters only.
+const lowercase_table: [256]u8 = blk: {
+    @setEvalBranchQuota(10_000);
+    var t: [256]u8 = undefined;
+    for (&t, 0..) |*e, c| e.* = std.ascii.toLower(@intCast(c));
+    break :blk t;
+};
+
+/// Lane j: the maximum of lanes j-2 and j-1 of `v` (NEG where they don't
+/// exist). The first round of a prefix maximum: the full one would take
+/// log2(L) dependent shift-and-max rounds.
+fn maxOfPrevTwo(comptime L: usize, v: @Vector(L, Score)) @Vector(L, Score) {
+    const prev = shiftUp(L, v, 1);
+    return @max(prev, shiftUp(L, prev, 1));
 }
 
 /// `v` moved `k` lanes up, with NEG shifted into the bottom lanes.
@@ -480,16 +578,48 @@ test "chunked feeding gives the same score as one-shot" {
 
             var by_byte = m.start();
             for (cand) |c| m.feedByte(&by_byte, c);
-            try testing.expectEqual(whole, m.finish(&by_byte));
+            try testing.expectEqual(whole, m.finish(&by_byte, cand));
 
             for (1..cand.len + 1) |split| {
                 var s = m.start();
                 m.feed(&s, cand[0..split]);
                 m.feed(&s, cand[split..]);
-                try testing.expectEqual(whole, m.finish(&s));
+                try testing.expectEqual(whole, m.finish(&s, cand));
             }
         }
     }
+}
+
+test "finishBound never undercuts finish" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    const alphabet = "abcmainzigMAx/._-1";
+    const queries = [_][]const u8{ "", "a", "ma", "main", "mxin", "zig", "abc/x", "Main", "ii", "xyzzyq", "m.z" };
+
+    for (queries) |q| {
+        const m = try Matcher.init(q, .{});
+        for (0..300) |_| {
+            var buf: [24]u8 = undefined;
+            const len = rnd.intRangeAtMost(usize, 0, buf.len);
+            for (buf[0..len]) |*c| c.* = alphabet[rnd.uintLessThan(usize, alphabet.len)];
+            const cand = buf[0..len];
+
+            var state = m.start();
+            m.feed(&state, cand);
+            const got = m.finish(&state, cand);
+            const bound = m.finishBound(&state);
+            try testing.expectEqual(got == null, bound == null);
+            if (got) |g| try testing.expect(bound.? >= g);
+        }
+    }
+}
+
+test "the filename is the last run between slashes" {
+    // Doubled and trailing slashes don't start an empty filename
+    try testing.expectEqual(scoreOf("docs", "a/docs/"), scoreOf("docs", "a/docs//"));
+    try expectBetter("docs", "project/docs//", "do/cs/");
+    // The filename bonus needs the whole query inside the last segment
+    try expectBetter("main", "src/main.zig", "ma/in.zig");
 }
 
 test "snapshot and restore, as in a trie walk" {
@@ -500,11 +630,11 @@ test "snapshot and restore, as in a trie walk" {
     const snapshot = state;
 
     m.feed(&state, "file-index.zig");
-    try testing.expectEqual(m.score("src/file-index.zig"), m.finish(&state));
+    try testing.expectEqual(m.score("src/file-index.zig"), m.finish(&state, "src/file-index.zig"));
 
     state = snapshot;
     m.feed(&state, "main.zig");
-    try testing.expectEqual(m.score("src/main.zig"), m.finish(&state));
+    try testing.expectEqual(m.score("src/main.zig"), m.finish(&state, "src/main.zig"));
 }
 
 test "filename matches beat matches spread across directories" {
@@ -628,7 +758,7 @@ test "typos: chunked feeding gives the same score as one-shot" {
         var s = m.start();
         m.feed(&s, cand[0..split]);
         m.feed(&s, cand[split..]);
-        try testing.expectEqual(whole, m.finish(&s));
+        try testing.expectEqual(whole, m.finish(&s, cand));
     }
 }
 
@@ -686,7 +816,7 @@ test "subtreeBound never undercuts what feeding the rest can reach" {
 
                 m.feed(&state, cand[split..]);
                 try testing.expect(bound >= state.full.done);
-                if (!reachable) try testing.expect(m.finish(&state).? < threshold);
+                if (!reachable) try testing.expect(m.finish(&state, cand).? < threshold);
             }
         }
     }

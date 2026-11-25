@@ -407,11 +407,17 @@ pub const Trie = struct {
     ) error{OutOfMemory}!void {
         const items = path.items;
         if (self.isFinal and items.len > 0 and (includeDirs or items[items.len - 1] != '/')) {
-            if (matcher.finish(state)) |score| {
-                const tiebreak: u32 = @intCast(@min(items.len, std.math.maxInt(u32)));
-                if (top.accepts(score, tiebreak)) {
-                    const copy = try allocator.dupe(u8, items);
-                    if (top.push(score, tiebreak, copy)) |dropped| allocator.free(dropped);
+            const tiebreak: u32 = @intCast(@min(items.len, std.math.maxInt(u32)));
+            // Most finals can't make it even with the best filename match, and
+            // that is the cheap check: the filename match is built only past it
+            if (matcher.finishBound(state)) |bound| {
+                if (top.accepts(bound, tiebreak)) {
+                    if (matcher.finish(state, items)) |score| {
+                        if (top.accepts(score, tiebreak)) {
+                            const copy = try allocator.dupe(u8, items);
+                            if (top.push(score, tiebreak, copy)) |dropped| allocator.free(dropped);
+                        }
+                    }
                 }
             }
         }
