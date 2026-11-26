@@ -4,37 +4,49 @@
 //!
 //! Protocol, one request per connection:
 //!   request:  one JSON object on a line, with a "command" field:
-//!             {"command":"search","query":"main.zig","limit":50}   ("limit" is optional)
+//!             {"command":"search","query":"main.zig","limit":50}   ("limit" is optional: the
+//!                                              config's limit is the default)
 //!             {"command":"version"}
+//!             {"command":"config"}                 the config, as the daemon has it
+//!             {"command":"setConfig","config":{"include":["/Users/me"],"exclude":["node_modules"],"limit":30}}
+//!                 Any field of "config" can be left out to keep it. The daemon checks, saves and
+//!                 applies it, and answers with the config as saved. A change to the includes or
+//!                 excludes rebuilds the index in the background; searches go on meanwhile.
+//!             {"command":"status"}                 whether the index is being rebuilt
 //!   response: one JSON object on a line, then the server closes. It always has a "version"
 //!             field, errors included, so a client can check it before reading anything else:
-//!             {"version":1,"matches":[{"score":123,"path":"/Users/me/work/main.zig"}]}
-//!             {"version":1}
-//!             {"version":1,"error":"unknown command: foo"}
+//!             {"version":2,"matches":[{"score":123,"path":"/Users/me/work/main.zig"}]}
+//!             {"version":2}
+//!             {"version":2,"config":{"include":[...],"exclude":[...],"limit":50}}
+//!             {"version":2,"indexing":false}
+//!             {"version":2,"error":"unknown command: foo"}
 //!             Matches are best first. Folder paths end with "/".
+//!   The config lives in a file the daemon alone writes, see config.zig.
 //!   Bump `protocol_version` when a change would break an older client; unknown fields in a
 //!   request are ignored, unknown commands get an error response.
 const std = @import("std");
 const fileIndex = @import("file-index.zig");
 const indexer = @import("indexer.zig");
-const watcher = @import("watcher.zig");
-
-const default_limit = 50;
-const max_limit = 1000;
+const config = @import("config.zig");
 
 var gpa: std.mem.Allocator = undefined;
 var io: std.Io = undefined;
 
-pub const protocol_version = 1;
+/// 2: the config, setConfig and status commands; the search limit defaults to the config's.
+pub const protocol_version = 2;
+
+var store: *config.Store = undefined;
 
 const Request = struct {
     command: ?[]const u8 = null,
     query: ?[]const u8 = null,
     limit: ?i64 = null,
+    config: ?config.Wire = null,
 };
 
 fn serve(stream: std.Io.net.Stream) !void {
-    var inBuf: [4096]u8 = undefined;
+    // Room for a long list of folders in setConfig
+    var inBuf: [64 * 1024]u8 = undefined;
     var reader = stream.reader(io, &inBuf);
     var outBuf: [16 * 1024]u8 = undefined;
     var writer = stream.writer(io, &outBuf);
@@ -61,12 +73,40 @@ fn serve(stream: std.Io.net.Stream) !void {
     }
     if (std.mem.eql(u8, command, "search")) {
         const query = std.mem.trim(u8, request.query orelse "", " \t\r");
-        const limit: usize = @intCast(std.math.clamp(request.limit orelse default_limit, 1, max_limit));
+        const limit: usize = if (request.limit) |l|
+            @intCast(std.math.clamp(l, 1, config.max_limit))
+        else
+            store.limit.load(.monotonic);
         if (query.len == 0) return finish(&writer, writeResults(&writer.interface, &.{}));
 
         const results = try indexer.index.search(gpa, query, .{ .limit = limit });
         defer fileIndex.freeSearchResults(gpa, results);
         return finish(&writer, writeResults(&writer.interface, results));
+    }
+
+    if (std.mem.eql(u8, command, "config")) {
+        var current = try store.snapshot();
+        defer current.deinit();
+        return finish(&writer, writeConfig(&writer.interface, current.value));
+    }
+    if (std.mem.eql(u8, command, "setConfig")) {
+        const wire = request.config orelse {
+            return finish(&writer, writeError(&writer.interface, "missing \"config\" field"));
+        };
+        var diag: config.Diagnostic = .{};
+        var change = store.update(wire, &diag) catch |err| switch (err) {
+            error.InvalidConfig => return finish(&writer, writeError(&writer.interface, diag.message())),
+            else => {
+                std.debug.print("config: saving failed: {any}\n", .{err});
+                return finish(&writer, writeError(&writer.interface, "could not save the config"));
+            },
+        };
+        defer change.config.deinit();
+        if (change.scopeChanged) requestReindex();
+        return finish(&writer, writeConfig(&writer.interface, change.config.value));
+    }
+    if (std.mem.eql(u8, command, "status")) {
+        return finish(&writer, writeStatus(&writer.interface, isIndexing()));
     }
 
     var buf: [256]u8 = undefined;
@@ -87,6 +127,18 @@ fn clientLeft(err: anyerror) bool {
 
 fn writeVersion(out: *std.Io.Writer) std.Io.Writer.Error!void {
     try out.print("{{\"version\":{d}}}\n", .{protocol_version});
+    try out.flush();
+}
+
+fn writeConfig(out: *std.Io.Writer, cfg: config.Config) std.Io.Writer.Error!void {
+    try out.print("{{\"version\":{d},\"config\":", .{protocol_version});
+    try std.json.Stringify.value(cfg, .{}, out);
+    try out.writeAll("}\n");
+    try out.flush();
+}
+
+fn writeStatus(out: *std.Io.Writer, indexing: bool) std.Io.Writer.Error!void {
+    try out.print("{{\"version\":{d},\"indexing\":{}}}\n", .{ protocol_version, indexing });
     try out.flush();
 }
 
@@ -129,19 +181,70 @@ fn raiseOpenFileLimit() void {
     };
 }
 
-pub const Server = struct {
-    fsWatcher: *watcher.Watcher,
+/// Rebuilds the index for the current config, off the request that asked for it. Changes that
+/// arrive while it runs are picked up by one more round, so a burst of edits costs two rebuilds
+/// at most.
+var reindexMutex: std.Io.Mutex = .init;
+var reindexRunning = false;
+var reindexAgain = false;
 
-    /// Indexes everything under `root` (absolute) and starts watching it for changes.
-    pub fn start(allocator: std.mem.Allocator, theIo: std.Io, root: []const u8) !Server {
+fn requestReindex() void {
+    reindexMutex.lockUncancelable(io);
+    defer reindexMutex.unlock(io);
+
+    if (reindexRunning) {
+        reindexAgain = true;
+        return;
+    }
+    const thread = std.Thread.spawn(.{}, reindexLoop, .{}) catch |err| {
+        std.debug.print("config: cannot start the reindex: {any}\n", .{err});
+        return;
+    };
+    reindexRunning = true;
+    thread.detach();
+}
+
+fn reindexLoop() void {
+    while (true) {
+        if (store.snapshot()) |snapshot| {
+            var current = snapshot;
+            defer current.deinit();
+            indexer.reconfigure(current.value) catch |err| std.debug.print("config: reindex failed: {any}\n", .{err});
+        } else |err| std.debug.print("config: reindex failed: {any}\n", .{err});
+
+        reindexMutex.lockUncancelable(io);
+        defer reindexMutex.unlock(io);
+        if (!reindexAgain) {
+            reindexRunning = false;
+            return;
+        }
+        reindexAgain = false;
+    }
+}
+
+fn isIndexing() bool {
+    reindexMutex.lockUncancelable(io);
+    defer reindexMutex.unlock(io);
+    return reindexRunning;
+}
+
+pub const Server = struct {
+    /// Indexes what the config in `configStore` includes and starts watching it for changes.
+    pub fn start(allocator: std.mem.Allocator, theIo: std.Io, configStore: *config.Store) !Server {
         gpa = allocator;
         io = theIo;
+        store = configStore;
         raiseOpenFileLimit();
-        return .{ .fsWatcher = try indexer.start(gpa, io, root) };
+
+        var current = try store.snapshot();
+        defer current.deinit();
+        try indexer.start(gpa, io, current.value);
+        return .{};
     }
 
     pub fn stop(self: *Server) void {
-        self.fsWatcher.stop(gpa);
+        _ = self;
+        indexer.stop();
     }
 
     /// Answers queries on the already-bound socket until accept fails.

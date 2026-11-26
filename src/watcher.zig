@@ -64,6 +64,10 @@ const Raw = struct {
     }
 };
 
+/// The path of a rescan when a whole batch is lost: it is not known where, so it covers every
+/// watched folder.
+const rescan_everything = "/";
+
 /// A batch with more events than this is not translated: the whole watched folder is rescanned.
 /// About 50k events is some 15MB of paths and a few seconds of pairing work.
 const max_batch_events = 50_000;
@@ -121,34 +125,42 @@ pub const Watcher = struct {
     handler: Handler,
     context: ?*anyopaque,
     allocator: std.mem.Allocator,
-    /// The watched folder, what gets rescanned when a whole batch is lost.
-    root: [:0]const u8,
 
+    /// The newest event so far. A watcher started with it as `since` is told everything that
+    /// happens from now on, even when it only starts a while later.
+    pub fn currentEventId() u64 {
+        return c.FSEventsGetCurrentEventId();
+    }
+
+    /// Watches the folders `paths` (absolute, at least one) and everything below them. With
+    /// `since`, events from after that id (see `currentEventId`) are reported too, otherwise
+    /// only those from now on.
     pub fn start(
         allocator: std.mem.Allocator,
-        path: []const u8,
+        paths: []const []const u8,
         latency_seconds: f64,
+        since: ?u64,
         handler: Handler,
         context: ?*anyopaque,
     ) !*Watcher {
+        std.debug.assert(paths.len > 0);
         const self = try allocator.create(Watcher);
         errdefer allocator.destroy(self);
         self.handler = handler;
         self.context = context;
         self.allocator = allocator;
 
-        const pathZ = try allocator.dupeSentinel(u8, path, 0);
-        errdefer allocator.free(pathZ);
-        self.root = pathZ;
-
-        const cfPath = c.CFStringCreateWithCString(null, pathZ.ptr, c.kCFStringEncodingUTF8) orelse
-            return error.OutOfMemory;
-        defer c.CFRelease(cfPath);
-
-        var values = [_]?*const anyopaque{cfPath};
-        const cfPaths = c.CFArrayCreate(null, @ptrCast(&values), 1, &c.kCFTypeArrayCallBacks) orelse
+        const cfPaths = c.CFArrayCreateMutable(null, 0, &c.kCFTypeArrayCallBacks) orelse
             return error.OutOfMemory;
         defer c.CFRelease(cfPaths);
+        for (paths) |path| {
+            const pathZ = try allocator.dupeSentinel(u8, path, 0);
+            defer allocator.free(pathZ);
+            const cfPath = c.CFStringCreateWithCString(null, pathZ.ptr, c.kCFStringEncodingUTF8) orelse
+                return error.OutOfMemory;
+            defer c.CFRelease(cfPath);
+            c.CFArrayAppendValue(cfPaths, cfPath);
+        }
 
         var streamContext = c.FSEventStreamContext{
             .version = 0,
@@ -172,7 +184,7 @@ pub const Watcher = struct {
             callback,
             &streamContext,
             cfPaths,
-            c.kFSEventStreamEventIdSinceNow,
+            since orelse c.kFSEventStreamEventIdSinceNow,
             latency_seconds,
             flags,
         ) orelse return error.StreamCreateFailed;
@@ -188,14 +200,18 @@ pub const Watcher = struct {
         return self;
     }
 
+    /// Returns once no handler call is running or will run again. Not for use from the handler.
     pub fn stop(self: *Watcher, allocator: std.mem.Allocator) void {
         c.FSEventStreamStop(self.stream);
         c.FSEventStreamInvalidate(self.stream);
+        // A callback that was already running holds the queue; this waits for it
+        c.dispatch_sync_f(self.queue, null, barrier);
         c.FSEventStreamRelease(self.stream);
         c.dispatch_release(.{ ._dq = self.queue });
-        allocator.free(self.root);
         allocator.destroy(self);
     }
+
+    fn barrier(_: ?*anyopaque) callconv(.c) void {}
 };
 
 fn pathExists(path: [:0]const u8) bool {
@@ -267,7 +283,7 @@ fn callback(
     // pairing), and applying it event by event costs more than walking the tree again
     if (numEvents > max_batch_events) {
         std.debug.print("watcher: {d} events in one batch, rescanning\n", .{numEvents});
-        self.handler(self.context, .{ .rescan = .{ .path = self.root } });
+        self.handler(self.context, .{ .rescan = .{ .path = rescan_everything } });
         return;
     }
 
@@ -277,7 +293,7 @@ fn callback(
     const raws = readEvents(arena.allocator(), @ptrCast(eventPaths.?), eventFlags, numEvents) catch |err| {
         // We cannot tell what was in the batch, so anything may have changed
         std.debug.print("watcher: dropped {d} events: {any}, rescanning\n", .{ numEvents, err });
-        self.handler(self.context, .{ .rescan = .{ .path = self.root } });
+        self.handler(self.context, .{ .rescan = .{ .path = rescan_everything } });
         return;
     };
 
@@ -432,7 +448,7 @@ test "reports adds, removes and moves of files and folders" {
     const root = buf[0..len];
 
     var state = LiveState{};
-    const w = try Watcher.start(gpa, root, 0.05, liveHandler, &state);
+    const w = try Watcher.start(gpa, &.{root}, 0.05, null, liveHandler, &state);
     defer w.stop(gpa);
 
     var from: [std.posix.PATH_MAX]u8 = undefined;

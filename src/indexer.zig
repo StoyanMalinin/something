@@ -4,6 +4,7 @@ const std = @import("std");
 const fileIndex = @import("file-index.zig");
 const watcher = @import("watcher.zig");
 const walk = @import("walk.zig");
+const config = @import("config.zig");
 
 pub var index: *fileIndex.FileIndex = undefined;
 
@@ -18,7 +19,7 @@ fn scanFolder(path: []const u8, position: fileIndex.Position) !void {
     };
     defer dir.close(io);
 
-    _ = try walk.walkSingleThreaded(&dir, position);
+    _ = try walk.walkSingleThreaded(&dir, position, path);
     try index.refreshMasks(position, path);
 }
 
@@ -39,6 +40,10 @@ fn removeFromIndex(path: []const u8, kind: watcher.Kind) !void {
 }
 
 fn moveInIndex(from: []const u8, to: []const u8, kind: watcher.Kind) !void {
+    // Moved out of, or into, what is left out: only one side is ours
+    if (filter.excludes(to)) return removeFromIndex(from, kind);
+    if (filter.excludes(from)) return addToIndex(to, kind);
+
     const root = index.rootPosition();
     const moved = switch (kind) {
         .file => try index.moveOrdinaryFile(root, from, root, to),
@@ -51,15 +56,16 @@ fn moveInIndex(from: []const u8, to: []const u8, kind: watcher.Kind) !void {
     }
 }
 
-/// The watched folder, what `rebuild` walks.
-var rootPath: []u8 = &.{};
+/// What is indexed and what is left out. Only changes while the watcher is stopped.
+var filter: config.Filter = undefined;
+var fsWatcher: ?*watcher.Watcher = null;
 
-/// Walks `rootPath` into a fresh index and swaps its trie in. Searches keep using the old trie
+/// Walks the roots into a fresh index and swaps its trie in. Searches keep using the old trie
 /// until the swap, and the new one is packed exactly: it has no dead or half-empty blocks, which
 /// editing the old one in place only ever adds. Needs room for both tries at once.
 ///
-/// Runs on the watcher's queue, so events that arrive meanwhile wait and are applied to the new
-/// trie afterwards, which is harmless: they are idempotent.
+/// Runs on the watcher's queue, or while the watcher is stopped. Events that arrive meanwhile
+/// wait and are applied to the new trie afterwards, which is harmless: they are idempotent.
 fn rebuild() !void {
     const fresh = try fileIndex.init(gpa, io, .{});
     defer fresh.deinit();
@@ -68,22 +74,10 @@ fn rebuild() !void {
     defer walk.index = index;
 
     try fresh.beginBulk();
-    _ = try walk.walk(rootPath);
+    _ = try walk.walk(filter.roots);
     try fresh.endBulk();
 
     index.swapTrie(fresh);
-}
-
-fn trimSlashes(path: []const u8) []const u8 {
-    return std.mem.trimEnd(u8, path, "/");
-}
-
-/// Whether `path` is the watched folder or one above it.
-fn coversRoot(path: []const u8) bool {
-    const p = trimSlashes(path);
-    const root = trimSlashes(rootPath);
-    if (!std.mem.startsWith(u8, root, p)) return false;
-    return root.len == p.len or root[p.len] == '/';
 }
 
 /// What dead space in the trie is worth a rebuild: it is only ever given back by one.
@@ -96,7 +90,8 @@ fn needsCompaction() bool {
 
 /// Events were lost under `path`: read it from disk again.
 fn rescanIndex(path: []const u8) !void {
-    if (coversRoot(path)) return rebuild();
+    if (filter.isAboveRoot(path)) return rebuild();
+    if (filter.excludes(path)) return;
 
     // Entries that vanished while we were not told are only dropped by removing the whole folder.
     // Searches may briefly miss that folder while it is rebuilt.
@@ -111,9 +106,11 @@ fn reportIndexError(what: []const u8, path: []const u8, err: anyerror) void {
 fn onFsEvent(_: ?*anyopaque, event: watcher.Event) void {
     switch (event) {
         .add => |e| {
+            if (filter.excludes(e.path)) return;
             addToIndex(e.path, e.kind) catch |err| reportIndexError("add", e.path, err);
         },
         .remove => |e| {
+            if (filter.excludes(e.path)) return;
             removeFromIndex(e.path, e.kind) catch |err| reportIndexError("remove", e.path, err);
         },
         .move => |e| {
@@ -125,28 +122,30 @@ fn onFsEvent(_: ?*anyopaque, event: watcher.Event) void {
     }
 
     if (needsCompaction()) {
-        rebuild() catch |err| reportIndexError("compact", rootPath, err);
+        rebuild() catch |err| reportIndexError("compact", "the index", err);
     }
 }
 
-/// Indexes everything under `path` (absolute), then returns the watcher that keeps
-/// `index` up to date. Stop it with `fsWatcher.stop(allocator)`.
-pub fn start(allocator: std.mem.Allocator, theIo: std.Io, path: []const u8) !*watcher.Watcher {
+/// Indexes what `cfg` includes, then watches it to keep `index` up to date. Undo with `stop`.
+pub fn start(allocator: std.mem.Allocator, theIo: std.Io, cfg: config.Config) !void {
     gpa = allocator;
     io = theIo;
     walk.gpa = gpa;
     walk.io = io;
-    rootPath = try gpa.dupe(u8, path);
+    filter = try config.Filter.init(gpa, cfg);
+    walk.filter = &filter;
 
     // Reserves the trie's node and label buffers at their largest; pages are
     // only backed as they fill up
     index = try fileIndex.init(gpa, io, .{});
 
+    // Changes during the walk are reported once the watcher is up
+    const since = watcher.Watcher.currentEventId();
     const startTime = std.Io.Clock.awake.now(io);
     walk.index = index;
     // The walk adds into a plain trie, packed into the search trie once done
     try index.beginBulk();
-    const cnt = try walk.walk(path);
+    const cnt = try walk.walk(filter.roots);
     const walkedTime = std.Io.Clock.awake.now(io);
     try index.endBulk();
     const endTime = std.Io.Clock.awake.now(io);
@@ -157,19 +156,39 @@ pub fn start(allocator: std.mem.Allocator, theIo: std.Io, path: []const u8) !*wa
     });
     std.debug.print("Total files: {d}\n", .{cnt});
 
-    return watcher.Watcher.start(gpa, path, 0.1, onFsEvent, null);
+    try startWatcher(since);
 }
 
-test "a rescan covers the root when it is the root or above it" {
-    const saved = rootPath;
-    defer rootPath = saved;
-    rootPath = @constCast("/Users/me/code");
+fn startWatcher(since: ?u64) !void {
+    if (filter.roots.len == 0) {
+        std.debug.print("index: nothing to watch, every include is left out\n", .{});
+        return;
+    }
+    fsWatcher = try watcher.Watcher.start(gpa, filter.roots, 0.1, since, onFsEvent, null);
+}
 
-    try std.testing.expect(coversRoot("/Users/me/code"));
-    try std.testing.expect(coversRoot("/Users/me/code/"));
-    try std.testing.expect(coversRoot("/Users/me"));
-    try std.testing.expect(coversRoot("/"));
-    try std.testing.expect(!coversRoot("/Users/me/code/src"));
-    try std.testing.expect(!coversRoot("/Users/me/cod"));
-    try std.testing.expect(!coversRoot("/Users/other"));
+pub fn stop() void {
+    if (fsWatcher) |w| w.stop(gpa);
+    fsWatcher = null;
+}
+
+/// Indexes `cfg` instead of what was indexed so far. Searches go on meanwhile, against the old
+/// index until the new one is ready. One call at a time, and not from the watcher's queue.
+pub fn reconfigure(cfg: config.Config) !void {
+    const next = try config.Filter.init(gpa, cfg);
+
+    // Whatever happens from here on is replayed to the new watcher
+    const since = watcher.Watcher.currentEventId();
+    stop();
+
+    // No handler is running now, so nothing reads the old filter
+    var old = filter;
+    filter = next;
+    old.deinit();
+
+    const startTime = std.Io.Clock.awake.now(io);
+    rebuild() catch |err| reportIndexError("rebuild", "after a config change", err);
+    std.debug.print("Reindexed in {d}ms\n", .{startTime.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds()});
+
+    try startWatcher(since);
 }

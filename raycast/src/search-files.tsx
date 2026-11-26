@@ -1,131 +1,23 @@
-import { Action, ActionPanel, getPreferenceValues, Icon, List } from "@raycast/api";
-import { createConnection } from "node:net";
-import { homedir } from "node:os";
+import { Action, ActionPanel, Icon, LaunchType, List, launchCommand } from "@raycast/api";
 import { basename, dirname } from "node:path";
 import { useEffect, useState } from "react";
+import { Match, describe, isConnectionError, search, tildify } from "./daemon";
+import { SetupHelp } from "./setup-help";
 
-interface Preferences {
-  socketPath?: string;
-  limit?: string;
-}
-
-interface Match {
-  score: number;
-  path: string;
-}
-
-const home = homedir();
-
-const REPO_URL = "https://github.com/StoyanMalinin/something";
-const BREW_FORMULA = "StoyanMalinin/tap/something-daemon";
-
-const SETUP_STEPS = [
-  { title: "Start the daemon", command: `brew services start ${BREW_FORMULA}`, icon: Icon.Play },
-  { title: "Install the daemon", command: `brew install ${BREW_FORMULA}`, icon: Icon.Download },
-  { title: "Install, building from source", command: `brew install --build-from-source ${BREW_FORMULA}`, icon: Icon.Hammer },
-];
-
-function expandHome(p: string): string {
-  return p === "~" || p.startsWith("~/") ? home + p.slice(1) : p;
-}
-
-function tildify(p: string): string {
-  return p === home || p.startsWith(home + "/") ? "~" + p.slice(home.length) : p;
-}
-
-// The oldest daemon protocol this extension works with. Every daemon response, errors
-// included, carries a "version"; raise this when the extension needs something newer.
-const MIN_PROTOCOL_VERSION = 1;
-
-class DaemonError extends Error {}
-
-interface Response {
-  version?: number;
-  error?: string;
-  matches?: Match[];
-}
-
-// One request per connection: send a JSON line with a "command", read one JSON line back.
-function query(socketPath: string, limit: number, text: string, signal: AbortSignal): Promise<Match[]> {
-  return new Promise((resolve, reject) => {
-    const socket = createConnection({ path: socketPath });
-    let data = "";
-    signal.addEventListener("abort", () => socket.destroy());
-    socket.setEncoding("utf8");
-    socket.on("connect", () => socket.end(JSON.stringify({ command: "search", query: text, limit }) + "\n"));
-    socket.on("data", (chunk: string) => (data += chunk));
-    socket.on("error", reject);
-    socket.on("close", () => {
-      if (signal.aborted) return;
-      try {
-        const response = JSON.parse(data) as Response;
-        if (typeof response.version !== "number") {
-          throw new DaemonError("The daemon sent no protocol version; update something-daemon");
-        }
-        if (response.version < MIN_PROTOCOL_VERSION) {
-          throw new DaemonError(
-            `something-daemon speaks protocol v${response.version}, this extension needs v${MIN_PROTOCOL_VERSION} or newer; update it`,
-          );
-        }
-        if (response.error !== undefined) throw new DaemonError(`Daemon error: ${response.error}`);
-        resolve(response.matches ?? []);
-      } catch (e) {
-        reject(e);
-      }
-    });
-  });
-}
+const configureAction = (
+  <Action
+    title="Configure Search…"
+    icon={Icon.Gear}
+    shortcut={{ modifiers: ["cmd"], key: "," }}
+    onAction={() => launchCommand({ name: "configure", type: LaunchType.UserInitiated })}
+  />
+);
 
 function formatLatency(ms: number): string {
   return `${ms < 10 ? ms.toFixed(1) : Math.round(ms)} ms`;
 }
 
-function isConnectionError(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException)?.code;
-  return code === "ENOENT" || code === "ECONNREFUSED";
-}
-
-function describe(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function SetupHelp() {
-  return (
-    <List.Section title="Can't reach something-daemon" subtitle="It isn't running, not installed, or still indexing">
-      {SETUP_STEPS.map((step) => (
-        <List.Item
-          key={step.command}
-          icon={step.icon}
-          title={step.title}
-          subtitle={step.command}
-          actions={
-            <ActionPanel>
-              <Action.CopyToClipboard title="Copy Command" content={step.command} />
-              <Action.OpenInBrowser title="View Source on Github" url={REPO_URL} />
-            </ActionPanel>
-          }
-        />
-      ))}
-      <List.Item
-        icon={Icon.Code}
-        title="Inspect the code on GitHub"
-        subtitle={REPO_URL}
-        actions={
-          <ActionPanel>
-            <Action.OpenInBrowser title="Open Repository" url={REPO_URL} />
-            <Action.CopyToClipboard title="Copy Link" content={REPO_URL} />
-          </ActionPanel>
-        }
-      />
-    </List.Section>
-  );
-}
-
 export default function Command() {
-  const prefs = getPreferenceValues<Preferences>();
-  const socketPath = expandHome(prefs.socketPath || "~/Library/Caches/something/daemon.sock");
-  const limit = Math.max(1, parseInt(prefs.limit || "50", 10) || 50);
-
   const [text, setText] = useState("");
   const [matches, setMatches] = useState<Match[]>([]);
   const [error, setError] = useState<string>();
@@ -146,7 +38,7 @@ export default function Command() {
     const controller = new AbortController();
     setIsLoading(true);
     const start = performance.now();
-    query(socketPath, limit, text, controller.signal)
+    search(text, controller.signal)
       .then((m) => {
         setLatencyMs(performance.now() - start);
         setMatches(m);
@@ -162,7 +54,7 @@ export default function Command() {
         if (!controller.signal.aborted) setIsLoading(false);
       });
     return () => controller.abort();
-  }, [text, socketPath, limit]);
+  }, [text]);
 
   return (
     <List
@@ -176,9 +68,18 @@ export default function Command() {
       ) : error ? (
         <List.EmptyView icon={Icon.ExclamationMark} title="Can't reach something-daemon" description={error} />
       ) : text.trim() === "" ? (
-        <List.EmptyView icon={Icon.MagnifyingGlass} title="Type to search every indexed file" />
+        <List.EmptyView
+          icon={Icon.MagnifyingGlass}
+          title="Type to search every indexed file"
+          actions={<ActionPanel>{configureAction}</ActionPanel>}
+        />
       ) : matches.length === 0 && latencyMs !== undefined ? (
-        <List.EmptyView icon={Icon.MagnifyingGlass} title="No matches" description={formatLatency(latencyMs)} />
+        <List.EmptyView
+          icon={Icon.MagnifyingGlass}
+          title="No matches"
+          description={formatLatency(latencyMs)}
+          actions={<ActionPanel>{configureAction}</ActionPanel>}
+        />
       ) : (
         <List.Section
           title={`${matches.length} ${matches.length === 1 ? "match" : "matches"}`}
@@ -215,6 +116,7 @@ function MatchItem({ match }: { match: Match }) {
             content={basename(path)}
             shortcut={{ modifiers: ["cmd", "shift"], key: "n" }}
           />
+          {configureAction}
         </ActionPanel>
       }
     />

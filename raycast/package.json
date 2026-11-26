@@ -20,6 +20,19 @@
         "file",
         "fuzzy"
       ]
+    },
+    {
+      "name": "configure",
+      "title": "Configure Search",
+      "description": "Choose which folders the daemon indexes, what it leaves out, and how many results a query returns",
+      "mode": "view",
+      "keywords": [
+        "settings",
+        "config",
+        "index",
+        "exclude",
+        "include"
+      ]
     }
   ],
   "preferences": [
@@ -32,12 +45,12 @@
       "default": "~/Library/Caches/something/daemon.sock"
     },
     {
-      "name": "limit",
-      "title": "Max Results",
-      "description": "How many matches to ask the daemon for",
+      "name": "configPath",
+      "title": "Daemon Config File",
+      "description": "The file the daemon keeps its config in. The extension only reads it; changes go through the daemon.",
       "type": "textfield",
       "required": false,
-      "default": "50"
+      "default": "~/Library/Application Support/something/config.json"
     }
   ],
   "scripts": {

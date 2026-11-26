@@ -1,29 +1,26 @@
 const std = @import("std");
 const fileIndex = @import("file-index.zig");
+const config = @import("config.zig");
 
+/// What to leave out. Set by the indexer before any walk.
+pub var filter: *const config.Filter = undefined;
 pub var index: *fileIndex.FileIndex = undefined;
 pub var gpa: std.mem.Allocator = undefined;
 pub var io: std.Io = undefined;
 
-/// macOS firmlinks `/Users`, `/Applications`, `/Library`, ... from the data volume
-/// mounted at `/System/Volumes/Data`. Firmlinks read as plain folders, so walking `/`
-/// would index all of those twice. Set by `walk` when that folder exists.
-var dataVolumeInode: ?std.Io.File.INode = null;
-
-/// Whether to leave out the folder `name` inside `dir`. Only stats folders named "Data",
-/// so the check is free for everything else.
-fn skipDir(dir: std.Io.Dir, name: []const u8) bool {
-    const inode = dataVolumeInode orelse return false;
-    if (!std.mem.eql(u8, name, "Data")) return false;
-    const st = dir.statFile(io, name, .{ .follow_symlinks = false }) catch return false;
-    return st.inode == inode;
+/// The absolute path of the entry `name` in the folder `dir`
+fn childPath(dir: []const u8, name: []const u8) ![]u8 {
+    if (std.mem.eql(u8, dir, "/")) return std.fmt.allocPrint(gpa, "/{s}", .{name});
+    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, name });
 }
 
-pub fn walkSingleThreaded(dir: *std.Io.Dir, position: fileIndex.Position) !i32 {
+/// Adds everything below `dir`, which is the folder `path` (absolute), at `position`.
+pub fn walkSingleThreaded(dir: *std.Io.Dir, position: fileIndex.Position, path: []const u8) !i32 {
     var cnt: i32 = 0;
+    const leftOut = filter.leftOutIn(path);
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
-        if (entry.kind == std.Io.File.Kind.directory and skipDir(dir.*, entry.name)) continue;
+        if (filter.skips(leftOut, entry.name)) continue;
 
         const subPosition = try index.addFileName(position, entry.name, entry.kind == std.Io.File.Kind.directory);
 
@@ -36,7 +33,9 @@ pub fn walkSingleThreaded(dir: *std.Io.Dir, position: fileIndex.Position) !i32 {
 
             if (subDir != null) {
                 defer subDir.?.close(io);
-                cnt += try walkSingleThreaded(&subDir.?, subPosition);
+                const subPath = try childPath(path, entry.name);
+                defer gpa.free(subPath);
+                cnt += try walkSingleThreaded(&subDir.?, subPosition, subPath);
             }
         } else {
             cnt += 1;
@@ -50,6 +49,8 @@ const MyDir = struct {
     dir: *?std.Io.Dir,
     stat: std.Io.Dir.Stat,
     position: fileIndex.Position,
+    /// Absolute path of the folder, owned by the item
+    path: []u8,
 };
 
 fn compareDir(_: void, a: MyDir, b: MyDir) std.math.Order {
@@ -62,11 +63,12 @@ fn compareDir(_: void, a: MyDir, b: MyDir) std.math.Order {
     return std.math.Order.eq;
 }
 
-fn walkWrapper(dir: *?std.Io.Dir, position: fileIndex.Position, mut: *std.Io.Mutex, cnt: *i32) void {
+fn walkWrapper(dir: *?std.Io.Dir, position: fileIndex.Position, path: []u8, mut: *std.Io.Mutex, cnt: *i32) void {
     defer gpa.destroy(dir);
     defer dir.*.?.close(io);
+    defer gpa.free(path);
 
-    const currCnt = walkSingleThreaded(&dir.*.?, position) catch |walkErr| blk: {
+    const currCnt = walkSingleThreaded(&dir.*.?, position, path) catch |walkErr| blk: {
         std.debug.print("Error: {any}\n", .{walkErr});
         break :blk 0;
     };
@@ -102,21 +104,37 @@ fn walker(queue: *Queue) void {
         queue.mutex.unlock(io);
 
         const item = next orelse return;
-        walkWrapper(item.dir, item.position, queue.mutex, queue.cnt);
+        walkWrapper(item.dir, item.position, item.path, queue.mutex, queue.cnt);
     }
 }
 
-pub fn walk(path: []const u8) !i32 {
+/// Adds every file below the folders `roots` (absolute) to `index`, leaving out what `filter`
+/// says. A root that cannot be opened is reported and skipped.
+pub fn walk(roots: []const []const u8) !i32 {
     var pq = DirQueue.initContext({});
     defer pq.deinit(gpa);
 
-    dataVolumeInode = if (std.Io.Dir.cwd().statFile(io, "/System/Volumes/Data", .{ .follow_symlinks = false })) |st| st.inode else |_| null;
+    const rootPositions = try gpa.alloc(?fileIndex.Position, roots.len);
+    defer gpa.free(rootPositions);
+    for (roots, rootPositions) |root, *rootPosition| {
+        rootPosition.* = null;
 
-    const dir = try gpa.create(?std.Io.Dir);
-    dir.* = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+        const dir = try gpa.create(?std.Io.Dir);
+        dir.* = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| {
+            std.debug.print("walk: cannot open {s}: {any}\n", .{ root, err });
+            gpa.destroy(dir);
+            continue;
+        };
 
-    const pathPosition = try index.addFileName(index.rootPosition(), path, true);
-    try pq.push(gpa, MyDir{ .dir = dir, .stat = try dir.*.?.stat(io), .position = pathPosition });
+        const pathPosition = try index.addFileName(index.rootPosition(), root, true);
+        rootPosition.* = pathPosition;
+        try pq.push(gpa, MyDir{
+            .dir = dir,
+            .stat = try dir.*.?.stat(io),
+            .position = pathPosition,
+            .path = try gpa.dupe(u8, root),
+        });
+    }
 
     var cnt: i32 = 0;
     var mutex: std.Io.Mutex = .init;
@@ -128,12 +146,14 @@ pub fn walk(path: []const u8) !i32 {
         const item: MyDir = pq.pop().?;
         defer gpa.destroy(item.dir);
         defer item.dir.*.?.close(io);
+        defer gpa.free(item.path);
 
         const position = item.position;
+        const leftOut = filter.leftOutIn(item.path);
 
         var it = item.dir.*.?.iterate();
         while (try it.next(io)) |entry| {
-            if (entry.kind == std.Io.File.Kind.directory and skipDir(item.dir.*.?, entry.name)) continue;
+            if (filter.skips(leftOut, entry.name)) continue;
 
             const subPosition = try index.addFileName(position, entry.name, entry.kind == std.Io.File.Kind.directory);
 
@@ -150,7 +170,10 @@ pub fn walk(path: []const u8) !i32 {
                         .dir = subDir,
                         .stat = try subDir.*.?.stat(io),
                         .position = subPosition,
+                        .path = try childPath(item.path, entry.name),
                     });
+                } else {
+                    gpa.destroy(subDir);
                 }
             } else {
                 cnt += 1;
@@ -169,7 +192,9 @@ pub fn walk(path: []const u8) !i32 {
     try group.await(io);
 
     // The masks above each walker's starting position missed its adds
-    try index.refreshMasks(pathPosition, path);
+    for (roots, rootPositions) |root, rootPosition| {
+        if (rootPosition) |position| try index.refreshMasks(position, root);
+    }
 
     return cnt;
 }

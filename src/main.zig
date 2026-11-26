@@ -4,6 +4,7 @@ const trie = @import("trie.zig");
 const indexer = @import("indexer.zig");
 const watcher = @import("watcher.zig");
 const walk = @import("walk.zig");
+const config = @import("config.zig");
 
 var index: *fileIndex.FileIndex = undefined;
 
@@ -53,8 +54,8 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const path = try std.Io.Dir.cwd().realPathFileAlloc(io, if (args.len > 1) args[1] else "/", init.arena.allocator());
 
-    const fsWatcher = try indexer.start(gpa, io, path);
-    defer fsWatcher.stop(gpa);
+    try indexer.start(gpa, io, .{ .include = &.{path}, .exclude = config.default_exclude, .limit = config.default_limit });
+    defer indexer.stop();
     index = indexer.index;
 
     const passsthroughCnt = index.trie.scanPassthoughNodes();
@@ -91,4 +92,5 @@ test {
     _ = trie;
     _ = watcher;
     _ = walk;
+    _ = config;
 }
