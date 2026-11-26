@@ -177,6 +177,16 @@ pub const FileIndex = struct {
         return self.trie.removeSingle(position, key);
     }
 
+    /// Takes `other`'s trie as this index's own, and leaves `other` with the old one, to be
+    /// freed with it. Searches see either one whole trie or the other. Nobody else may be
+    /// using `other`, and positions into either trie are void afterwards.
+    pub fn swapTrie(self: *FileIndex, other: *FileIndex) void {
+        self.mut.lockUncancelable(self.io);
+        defer self.mut.unlock(self.io);
+
+        std.mem.swap(trie.Trie, &self.trie, &other.trie);
+    }
+
     pub fn moveOrdinaryFile(
         self: *FileIndex,
         fromPosition: Position,
@@ -233,6 +243,23 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, limits: trie.Limits) !*Fil
     };
 
     return t;
+}
+
+test "swapping tries exchanges what the two indexes hold" {
+    const a = try init(std.testing.allocator, std.testing.io, trie.test_limits);
+    defer a.deinit();
+    const b = try init(std.testing.allocator, std.testing.io, trie.test_limits);
+    defer b.deinit();
+
+    _ = try a.addFileName(a.rootPosition(), "/old.txt", false);
+    _ = try b.addFileName(b.rootPosition(), "/new.txt", false);
+    _ = try b.addFileName(b.rootPosition(), "/newer.txt", false);
+
+    a.swapTrie(b);
+
+    try std.testing.expectEqual(0, try a.query("old"));
+    try std.testing.expectEqual(2, try a.query("new"));
+    try std.testing.expectEqual(1, try b.query("old"));
 }
 
 test "siblings that share a prefix do not collide" {

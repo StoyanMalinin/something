@@ -51,6 +51,59 @@ fn moveInIndex(from: []const u8, to: []const u8, kind: watcher.Kind) !void {
     }
 }
 
+/// The watched folder, what `rebuild` walks.
+var rootPath: []u8 = &.{};
+
+/// Walks `rootPath` into a fresh index and swaps its trie in. Searches keep using the old trie
+/// until the swap, and the new one is packed exactly: it has no dead or half-empty blocks, which
+/// editing the old one in place only ever adds. Needs room for both tries at once.
+///
+/// Runs on the watcher's queue, so events that arrive meanwhile wait and are applied to the new
+/// trie afterwards, which is harmless: they are idempotent.
+fn rebuild() !void {
+    const fresh = try fileIndex.init(gpa, io, .{});
+    defer fresh.deinit();
+
+    walk.index = fresh;
+    defer walk.index = index;
+
+    try fresh.beginBulk();
+    _ = try walk.walk(rootPath);
+    try fresh.endBulk();
+
+    index.swapTrie(fresh);
+}
+
+fn trimSlashes(path: []const u8) []const u8 {
+    return std.mem.trimEnd(u8, path, "/");
+}
+
+/// Whether `path` is the watched folder or one above it.
+fn coversRoot(path: []const u8) bool {
+    const p = trimSlashes(path);
+    const root = trimSlashes(rootPath);
+    if (!std.mem.startsWith(u8, root, p)) return false;
+    return root.len == p.len or root[p.len] == '/';
+}
+
+/// What dead space in the trie is worth a rebuild: it is only ever given back by one.
+const compact_min_dead_bytes = 64 << 20;
+
+fn needsCompaction() bool {
+    const dead = index.trie.dead_bytes;
+    return dead >= compact_min_dead_bytes and dead * 4 >= index.trie.used;
+}
+
+/// Events were lost under `path`: read it from disk again.
+fn rescanIndex(path: []const u8) !void {
+    if (coversRoot(path)) return rebuild();
+
+    // Entries that vanished while we were not told are only dropped by removing the whole folder.
+    // Searches may briefly miss that folder while it is rebuilt.
+    _ = try index.removeFileName(index.rootPosition(), path, true);
+    try addToIndex(path, .folder);
+}
+
 fn reportIndexError(what: []const u8, path: []const u8, err: anyerror) void {
     std.debug.print("index: {s} {s} failed: {any}\n", .{ what, path, err });
 }
@@ -66,6 +119,13 @@ fn onFsEvent(_: ?*anyopaque, event: watcher.Event) void {
         .move => |e| {
             moveInIndex(e.from, e.to, e.kind) catch |err| reportIndexError("move", e.to, err);
         },
+        .rescan => |e| {
+            rescanIndex(e.path) catch |err| reportIndexError("rescan", e.path, err);
+        },
+    }
+
+    if (needsCompaction()) {
+        rebuild() catch |err| reportIndexError("compact", rootPath, err);
     }
 }
 
@@ -76,6 +136,7 @@ pub fn start(allocator: std.mem.Allocator, theIo: std.Io, path: []const u8) !*wa
     io = theIo;
     walk.gpa = gpa;
     walk.io = io;
+    rootPath = try gpa.dupe(u8, path);
 
     // Reserves the trie's node and label buffers at their largest; pages are
     // only backed as they fill up
@@ -97,4 +158,18 @@ pub fn start(allocator: std.mem.Allocator, theIo: std.Io, path: []const u8) !*wa
     std.debug.print("Total files: {d}\n", .{cnt});
 
     return watcher.Watcher.start(gpa, path, 0.1, onFsEvent, null);
+}
+
+test "a rescan covers the root when it is the root or above it" {
+    const saved = rootPath;
+    defer rootPath = saved;
+    rootPath = @constCast("/Users/me/code");
+
+    try std.testing.expect(coversRoot("/Users/me/code"));
+    try std.testing.expect(coversRoot("/Users/me/code/"));
+    try std.testing.expect(coversRoot("/Users/me"));
+    try std.testing.expect(coversRoot("/"));
+    try std.testing.expect(!coversRoot("/Users/me/code/src"));
+    try std.testing.expect(!coversRoot("/Users/me/cod"));
+    try std.testing.expect(!coversRoot("/Users/other"));
 }

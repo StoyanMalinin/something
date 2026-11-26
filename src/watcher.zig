@@ -11,9 +11,13 @@ pub const Event = union(enum) {
     add: Change,
     remove: Change,
     move: Move,
+    /// Events were lost somewhere under `path`, so it is not known what changed there. The
+    /// consumer has to rebuild its view of that folder (and everything below) from disk.
+    rescan: Rescan,
 
     pub const Change = struct { path: []const u8, kind: Kind };
     pub const Move = struct { from: []const u8, to: []const u8, kind: Kind };
+    pub const Rescan = struct { path: []const u8 };
 };
 
 /// The paths inside an event are only valid during the call.
@@ -46,12 +50,25 @@ const Raw = struct {
             self.renamed();
     }
 
+    /// FSEvents says it dropped events (too many, or a slow consumer), or that its event ids
+    /// wrapped around, which makes it unable to tell us what changed under this path.
+    fn needsRescan(self: Raw) bool {
+        return self.has(c.kFSEventStreamEventFlagMustScanSubDirs) or
+            self.has(c.kFSEventStreamEventFlagUserDropped) or
+            self.has(c.kFSEventStreamEventFlagKernelDropped) or
+            self.has(c.kFSEventStreamEventFlagEventIdsWrapped);
+    }
+
     fn kind(self: Raw) Kind {
         return if (self.has(c.kFSEventStreamEventFlagItemIsDir)) .folder else .file;
     }
 };
 
-const ExistsFn = *const fn (path: [:0]const u8) bool;
+/// A batch with more events than this is not translated: the whole watched folder is rescanned.
+/// About 50k events is some 15MB of paths and a few seconds of pairing work.
+const max_batch_events = 50_000;
+
+const ExistsFn =*const fn (path: [:0]const u8) bool;
 
 /// Turns one batch of raw events into add, remove and move events.
 ///
@@ -60,19 +77,21 @@ const ExistsFn = *const fn (path: [:0]const u8) bool;
 /// remove. A rename shows up as two events, one for the old path and one for the new one,
 /// which are paired by their inode. A half without a partner (moved in from or out of the
 /// watched tree, or the other half arrived in another batch) is an add or a remove.
+///
+/// An event that says events were dropped under its path becomes a rescan of that path.
 fn translate(raws: []Raw, exists: ExistsFn, handler: Handler, context: ?*anyopaque) void {
     for (raws) |*raw| {
-        raw.consumed = !raw.relevant();
+        raw.consumed = !raw.relevant() and !raw.needsRescan();
         if (!raw.consumed) {
             raw.present = exists(raw.path);
         }
     }
 
     for (raws) |*to| {
-        if (to.consumed or !to.renamed() or !to.present or to.id == 0) continue;
+        if (to.consumed or to.needsRescan() or !to.renamed() or !to.present or to.id == 0) continue;
 
         for (raws, 0..) |*from, i| {
-            if (from.consumed or !from.renamed() or from.present) continue;
+            if (from.consumed or from.needsRescan() or !from.renamed() or from.present) continue;
             if (from.id != to.id or from.kind() != to.kind()) continue;
 
             from.consumed = true;
@@ -84,7 +103,9 @@ fn translate(raws: []Raw, exists: ExistsFn, handler: Handler, context: ?*anyopaq
     for (raws) |*raw| {
         if (raw.consumed) continue;
 
-        if (raw.movedFrom) |i| {
+        if (raw.needsRescan()) {
+            handler(context, .{ .rescan = .{ .path = raw.path } });
+        } else if (raw.movedFrom) |i| {
             handler(context, .{ .move = .{ .from = raws[i].path, .to = raw.path, .kind = raw.kind() } });
         } else if (raw.present) {
             handler(context, .{ .add = .{ .path = raw.path, .kind = raw.kind() } });
@@ -100,6 +121,8 @@ pub const Watcher = struct {
     handler: Handler,
     context: ?*anyopaque,
     allocator: std.mem.Allocator,
+    /// The watched folder, what gets rescanned when a whole batch is lost.
+    root: [:0]const u8,
 
     pub fn start(
         allocator: std.mem.Allocator,
@@ -115,7 +138,8 @@ pub const Watcher = struct {
         self.allocator = allocator;
 
         const pathZ = try allocator.dupeSentinel(u8, path, 0);
-        defer allocator.free(pathZ);
+        errdefer allocator.free(pathZ);
+        self.root = pathZ;
 
         const cfPath = c.CFStringCreateWithCString(null, pathZ.ptr, c.kCFStringEncodingUTF8) orelse
             return error.OutOfMemory;
@@ -169,6 +193,7 @@ pub const Watcher = struct {
         c.FSEventStreamInvalidate(self.stream);
         c.FSEventStreamRelease(self.stream);
         c.dispatch_release(.{ ._dq = self.queue });
+        allocator.free(self.root);
         allocator.destroy(self);
     }
 };
@@ -238,11 +263,21 @@ fn callback(
 ) callconv(.c) void {
     const self: *Watcher = @ptrCast(@alignCast(info.?));
 
+    // Translating a huge batch costs memory (a copy of every path) and quadratic time (rename
+    // pairing), and applying it event by event costs more than walking the tree again
+    if (numEvents > max_batch_events) {
+        std.debug.print("watcher: {d} events in one batch, rescanning\n", .{numEvents});
+        self.handler(self.context, .{ .rescan = .{ .path = self.root } });
+        return;
+    }
+
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
 
     const raws = readEvents(arena.allocator(), @ptrCast(eventPaths.?), eventFlags, numEvents) catch |err| {
-        std.debug.print("watcher: dropped {d} events: {any}\n", .{ numEvents, err });
+        // We cannot tell what was in the batch, so anything may have changed
+        std.debug.print("watcher: dropped {d} events: {any}, rescanning\n", .{ numEvents, err });
+        self.handler(self.context, .{ .rescan = .{ .path = self.root } });
         return;
     };
 
@@ -320,6 +355,29 @@ test "events without a partner, and coalesced flags" {
     }, collected.events.items);
 }
 
+test "dropped events become a rescan of that path" {
+    var raws = [_]Raw{
+        .{ .path = "/w/a", .flags = c.kFSEventStreamEventFlagMustScanSubDirs | c.kFSEventStreamEventFlagUserDropped | isDir, .id = 0 },
+        .{ .path = "/w/b", .flags = c.kFSEventStreamEventFlagMustScanSubDirs | c.kFSEventStreamEventFlagKernelDropped | isDir, .id = 0 },
+        .{ .path = "/w/c", .flags = c.kFSEventStreamEventFlagEventIdsWrapped, .id = 0 },
+        // Events that arrived intact in the same batch are still reported
+        .{ .path = "/w/new.txt", .flags = created | isFile, .id = 1 },
+        // Not a loss: a plain modification stays silent
+        .{ .path = "/w/changed.txt", .flags = modified | isFile, .id = 2 },
+    };
+
+    var collected = Collected{ .gpa = std.testing.allocator };
+    defer collected.events.deinit(std.testing.allocator);
+    translate(&raws, fakeExists, Collected.handler, &collected);
+
+    try std.testing.expectEqualDeep(&[_]Event{
+        .{ .rescan = .{ .path = "/w/a" } },
+        .{ .rescan = .{ .path = "/w/b" } },
+        .{ .rescan = .{ .path = "/w/c" } },
+        .{ .add = .{ .path = "/w/new.txt", .kind = .file } },
+    }, collected.events.items);
+}
+
 const LiveState = struct {
     fileAdded: std.atomic.Value(bool) = .init(false),
     fileMoved: std.atomic.Value(bool) = .init(false),
@@ -346,6 +404,7 @@ fn liveHandler(context: ?*anyopaque, event: Event) void {
             if (e.kind == .file and std.mem.endsWith(u8, e.path, "renamed.txt")) state.fileRemoved.store(true, .release);
             if (e.kind == .folder and std.mem.endsWith(u8, e.path, "folder-b")) state.folderRemoved.store(true, .release);
         },
+        .rescan => {},
     }
 }
 

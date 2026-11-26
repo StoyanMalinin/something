@@ -2,11 +2,18 @@
 //! socket someone else bound. It never writes to disk or opens sockets, so it runs inside
 //! the sandbox.
 //!
-//! Protocol, one query per connection:
-//!   request:  "<limit>\t<query>\n"   (or just "<query>\n" for the default limit)
-//!   response: one JSON object per line, best match first, then the server closes:
-//!             {"score":123,"path":"/Users/me/work/main.zig"}
-//!             Folder paths end with "/".
+//! Protocol, one request per connection:
+//!   request:  one JSON object on a line, with a "command" field:
+//!             {"command":"search","query":"main.zig","limit":50}   ("limit" is optional)
+//!             {"command":"version"}
+//!   response: one JSON object on a line, then the server closes. It always has a "version"
+//!             field, errors included, so a client can check it before reading anything else:
+//!             {"version":1,"matches":[{"score":123,"path":"/Users/me/work/main.zig"}]}
+//!             {"version":1}
+//!             {"version":1,"error":"unknown command: foo"}
+//!             Matches are best first. Folder paths end with "/".
+//!   Bump `protocol_version` when a change would break an older client; unknown fields in a
+//!   request are ignored, unknown commands get an error response.
 const std = @import("std");
 const fileIndex = @import("file-index.zig");
 const indexer = @import("indexer.zig");
@@ -18,14 +25,13 @@ const max_limit = 1000;
 var gpa: std.mem.Allocator = undefined;
 var io: std.Io = undefined;
 
-fn parseRequest(line: []const u8) struct { limit: usize, query: []const u8 } {
-    if (std.mem.indexOfScalar(u8, line, '\t')) |tab| {
-        if (std.fmt.parseInt(usize, line[0..tab], 10)) |limit| {
-            return .{ .limit = std.math.clamp(limit, 1, max_limit), .query = line[tab + 1 ..] };
-        } else |_| {}
-    }
-    return .{ .limit = default_limit, .query = line };
-}
+pub const protocol_version = 1;
+
+const Request = struct {
+    command: ?[]const u8 = null,
+    query: ?[]const u8 = null,
+    limit: ?i64 = null,
+};
 
 fn serve(stream: std.Io.net.Stream) !void {
     var inBuf: [4096]u8 = undefined;
@@ -33,21 +39,44 @@ fn serve(stream: std.Io.net.Stream) !void {
     var outBuf: [16 * 1024]u8 = undefined;
     var writer = stream.writer(io, &outBuf);
 
-    const line = (reader.interface.takeDelimiter('\n') catch |err| switch (err) {
+    const line = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
         error.ReadFailed => return if (clientLeft(reader.err.?)) {} else reader.err.?,
-        else => return err,
-    }) orelse return;
-    const request = parseRequest(line);
-    const query = std.mem.trim(u8, request.query, " \t\r");
-    if (query.len == 0) return;
+        error.StreamTooLong => {
+            return finish(&writer, writeError(&writer.interface, "request too long"));
+        },
+    } orelse return;
 
-    const results = try indexer.index.search(gpa, query, .{ .limit = request.limit });
-    defer fileIndex.freeSearchResults(gpa, results);
-
-    writeResults(&writer.interface, results) catch {
-        // WriteFailed hides the cause, which the stream keeps
-        return if (clientLeft(writer.err.?)) {} else writer.err.?;
+    const parsed = std.json.parseFromSlice(Request, gpa, line, .{ .ignore_unknown_fields = true }) catch {
+        return finish(&writer, writeError(&writer.interface, "request is not a valid JSON object"));
     };
+    defer parsed.deinit();
+    const request = parsed.value;
+
+    const command = request.command orelse {
+        return finish(&writer, writeError(&writer.interface, "missing \"command\" field"));
+    };
+
+    if (std.mem.eql(u8, command, "version")) {
+        return finish(&writer, writeVersion(&writer.interface));
+    }
+    if (std.mem.eql(u8, command, "search")) {
+        const query = std.mem.trim(u8, request.query orelse "", " \t\r");
+        const limit: usize = @intCast(std.math.clamp(request.limit orelse default_limit, 1, max_limit));
+        if (query.len == 0) return finish(&writer, writeResults(&writer.interface, &.{}));
+
+        const results = try indexer.index.search(gpa, query, .{ .limit = limit });
+        defer fileIndex.freeSearchResults(gpa, results);
+        return finish(&writer, writeResults(&writer.interface, results));
+    }
+
+    var buf: [256]u8 = undefined;
+    const message = std.fmt.bufPrint(&buf, "unknown command: {s}", .{command[0..@min(command.len, 100)]}) catch "unknown command";
+    return finish(&writer, writeError(&writer.interface, message));
+}
+
+/// WriteFailed hides the cause, which the stream keeps
+fn finish(writer: *std.Io.net.Stream.Writer, result: std.Io.Writer.Error!void) !void {
+    result catch return if (clientLeft(writer.err.?)) {} else writer.err.?;
 }
 
 /// The client hung up before reading everything: Raycast does this to every query a
@@ -56,12 +85,27 @@ fn clientLeft(err: anyerror) bool {
     return err == error.SocketUnconnected or err == error.ConnectionResetByPeer;
 }
 
+fn writeVersion(out: *std.Io.Writer) std.Io.Writer.Error!void {
+    try out.print("{{\"version\":{d}}}\n", .{protocol_version});
+    try out.flush();
+}
+
+fn writeError(out: *std.Io.Writer, message: []const u8) std.Io.Writer.Error!void {
+    try out.print("{{\"version\":{d},\"error\":", .{protocol_version});
+    try std.json.Stringify.encodeJsonString(message, .{}, out);
+    try out.writeAll("}\n");
+    try out.flush();
+}
+
 fn writeResults(out: *std.Io.Writer, results: []const fileIndex.SearchResult) std.Io.Writer.Error!void {
-    for (results) |r| {
+    try out.print("{{\"version\":{d},\"matches\":[", .{protocol_version});
+    for (results, 0..) |r, i| {
+        if (i > 0) try out.writeAll(",");
         try out.print("{{\"score\":{d},\"path\":", .{r.score});
         try std.json.Stringify.encodeJsonString(r.path, .{}, out);
-        try out.writeAll("}\n");
+        try out.writeAll("}");
     }
+    try out.writeAll("]}\n");
     try out.flush();
 }
 

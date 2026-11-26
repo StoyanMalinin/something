@@ -33,25 +33,42 @@ function tildify(p: string): string {
   return p === home || p.startsWith(home + "/") ? "~" + p.slice(home.length) : p;
 }
 
-// One query per connection: send "<limit>\t<query>\n", read JSON lines until the daemon closes.
+// The oldest daemon protocol this extension works with. Every daemon response, errors
+// included, carries a "version"; raise this when the extension needs something newer.
+const MIN_PROTOCOL_VERSION = 1;
+
+class DaemonError extends Error {}
+
+interface Response {
+  version?: number;
+  error?: string;
+  matches?: Match[];
+}
+
+// One request per connection: send a JSON line with a "command", read one JSON line back.
 function query(socketPath: string, limit: number, text: string, signal: AbortSignal): Promise<Match[]> {
   return new Promise((resolve, reject) => {
     const socket = createConnection({ path: socketPath });
     let data = "";
     signal.addEventListener("abort", () => socket.destroy());
     socket.setEncoding("utf8");
-    socket.on("connect", () => socket.end(`${limit}\t${text.replace(/[\r\n]/g, " ")}\n`));
+    socket.on("connect", () => socket.end(JSON.stringify({ command: "search", query: text, limit }) + "\n"));
     socket.on("data", (chunk: string) => (data += chunk));
     socket.on("error", reject);
     socket.on("close", () => {
       if (signal.aborted) return;
       try {
-        resolve(
-          data
-            .split("\n")
-            .filter((line) => line.length > 0)
-            .map((line) => JSON.parse(line) as Match),
-        );
+        const response = JSON.parse(data) as Response;
+        if (typeof response.version !== "number") {
+          throw new DaemonError("The daemon sent no protocol version; update something-daemon");
+        }
+        if (response.version < MIN_PROTOCOL_VERSION) {
+          throw new DaemonError(
+            `something-daemon speaks protocol v${response.version}, this extension needs v${MIN_PROTOCOL_VERSION} or newer; update it`,
+          );
+        }
+        if (response.error !== undefined) throw new DaemonError(`Daemon error: ${response.error}`);
+        resolve(response.matches ?? []);
       } catch (e) {
         reject(e);
       }
