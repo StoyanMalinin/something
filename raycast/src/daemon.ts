@@ -3,10 +3,19 @@ import { readFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
 
-// The oldest daemon protocol this extension works with. Every daemon response, errors
-// included, carries a "version"; raise this when the extension needs something newer.
+// The oldest daemon protocol this extension works with: below it we refuse to talk. Every
+// daemon response, errors included, carries a "version"; raise this when the extension
+// cannot do without something newer.
 // 2: the config, setConfig and status commands
 const MIN_PROTOCOL_VERSION = 2;
+// The newest protocol this extension knows. A daemon between the two works, but misses
+// features, so the UI asks the user to upgrade and restart it.
+// 3: "issues" in search and status responses
+export const NEWEST_PROTOCOL_VERSION = 3;
+
+export function isOutdated(daemonVersion: number): boolean {
+  return daemonVersion < NEWEST_PROTOCOL_VERSION;
+}
 
 export const home = homedir();
 
@@ -48,12 +57,33 @@ export interface Match {
   path: string;
 }
 
+/** Parts of the tree the daemon could not cover. Absent from a response when all is well. */
+export interface Issues {
+  /** Folders it may not open, so their files are missing from results (on macOS: no Full Disk Access) */
+  unreadable: number;
+  /** Other errors that left the index incomplete or stale */
+  failed: number;
+  /** A few unreadable folders, shallowest first */
+  samples: string[];
+}
+
+/** What every response says about the daemon itself */
+export interface DaemonStatus {
+  version: number;
+  issues?: Issues;
+}
+
 interface Response {
   version?: number;
   error?: string;
   matches?: Match[];
   config?: DaemonConfig;
   indexing?: boolean;
+  issues?: Issues;
+}
+
+function statusOf(response: Response): DaemonStatus {
+  return { version: response.version ?? 0, issues: response.issues };
 }
 
 export class DaemonError extends Error {}
@@ -89,9 +119,18 @@ function request(command: object, signal?: AbortSignal): Promise<Response> {
   });
 }
 
-/** Matches for `text`, best first. How many is up to the daemon's config. */
-export async function search(text: string, signal: AbortSignal): Promise<Match[]> {
-  return (await request({ command: "search", query: text }, signal)).matches ?? [];
+/** Matches for `text`, best first, and the daemon's status. How many is up to the daemon's config. */
+export async function search(
+  text: string,
+  signal: AbortSignal,
+): Promise<{ matches: Match[]; status: DaemonStatus }> {
+  const response = await request({ command: "search", query: text }, signal);
+  return { matches: response.matches ?? [], status: statusOf(response) };
+}
+
+/** The daemon's version and issues, without searching: for a screen that has no query yet. */
+export async function getStatus(): Promise<DaemonStatus> {
+  return statusOf(await request({ command: "status" }));
 }
 
 /**

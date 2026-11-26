@@ -1,8 +1,9 @@
 import { Action, ActionPanel, Icon, LaunchType, List, launchCommand } from "@raycast/api";
 import { basename, dirname } from "node:path";
 import { useEffect, useState } from "react";
-import { Match, describe, isConnectionError, search, tildify } from "./daemon";
+import { DaemonStatus, Match, describe, getStatus, isConnectionError, search, tildify } from "./daemon";
 import { SetupHelp } from "./setup-help";
+import { WarningsSection, hasWarnings } from "./warnings";
 
 const configureAction = (
   <Action
@@ -23,8 +24,17 @@ export default function Command() {
   const [error, setError] = useState<string>();
   const [unreachable, setUnreachable] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  // What the daemon said about itself last: its version and what it could not index
+  const [status, setStatus] = useState<DaemonStatus>();
   // Round trip of the query on screen: connect, search, and every result read back
   const [latencyMs, setLatencyMs] = useState<number>();
+
+  // Warnings show before the first query too
+  useEffect(() => {
+    getStatus()
+      .then(setStatus)
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (text.trim() === "") {
@@ -39,8 +49,9 @@ export default function Command() {
     setIsLoading(true);
     const start = performance.now();
     search(text, controller.signal)
-      .then((m) => {
+      .then(({ matches: m, status: daemonStatus }) => {
         setLatencyMs(performance.now() - start);
+        setStatus(daemonStatus);
         setMatches(m);
         setError(undefined);
         setUnreachable(false);
@@ -68,27 +79,21 @@ export default function Command() {
       ) : error ? (
         <List.EmptyView icon={Icon.ExclamationMark} title="Can't reach something-daemon" description={error} />
       ) : text.trim() === "" ? (
-        <List.EmptyView
-          icon={Icon.MagnifyingGlass}
-          title="Type to search every indexed file"
-          actions={<ActionPanel>{configureAction}</ActionPanel>}
-        />
+        <Empty status={status} title="Type to search every indexed file" />
       ) : matches.length === 0 && latencyMs !== undefined ? (
-        <List.EmptyView
-          icon={Icon.MagnifyingGlass}
-          title="No matches"
-          description={formatLatency(latencyMs)}
-          actions={<ActionPanel>{configureAction}</ActionPanel>}
-        />
+        <Empty status={status} title="No matches" description={formatLatency(latencyMs)} />
       ) : (
-        <List.Section
-          title={`${matches.length} ${matches.length === 1 ? "match" : "matches"}`}
-          subtitle={latencyMs === undefined ? undefined : formatLatency(latencyMs)}
-        >
-          {matches.map((m) => (
-            <MatchItem key={m.path} match={m} />
-          ))}
-        </List.Section>
+        <>
+          <WarningsSection status={status} />
+          <List.Section
+            title={`${matches.length} ${matches.length === 1 ? "match" : "matches"}`}
+            subtitle={latencyMs === undefined ? undefined : formatLatency(latencyMs)}
+          >
+            {matches.map((m) => (
+              <MatchItem key={m.path} match={m} />
+            ))}
+          </List.Section>
+        </>
       )}
     </List>
   );
@@ -120,5 +125,35 @@ function MatchItem({ match }: { match: Match }) {
         </ActionPanel>
       }
     />
+  );
+}
+
+/**
+ * An empty list. An EmptyView only shows while there are no rows at all, so when there are
+ * warnings to show they come first, followed by a plain row saying what the view would.
+ */
+function Empty({ status, title, description }: { status?: DaemonStatus; title: string; description?: string }) {
+  if (!hasWarnings(status)) {
+    return (
+      <List.EmptyView
+        icon={Icon.MagnifyingGlass}
+        title={title}
+        description={description}
+        actions={<ActionPanel>{configureAction}</ActionPanel>}
+      />
+    );
+  }
+  return (
+    <>
+      <WarningsSection status={status} />
+      <List.Section>
+        <List.Item
+          icon={Icon.MagnifyingGlass}
+          title={title}
+          subtitle={description}
+          actions={<ActionPanel>{configureAction}</ActionPanel>}
+        />
+      </List.Section>
+    </>
   );
 }

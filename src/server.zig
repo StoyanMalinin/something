@@ -15,12 +15,18 @@
 //!             {"command":"status"}                 whether the index is being rebuilt
 //!   response: one JSON object on a line, then the server closes. It always has a "version"
 //!             field, errors included, so a client can check it before reading anything else:
-//!             {"version":2,"matches":[{"score":123,"path":"/Users/me/work/main.zig"}]}
-//!             {"version":2}
-//!             {"version":2,"config":{"include":[...],"exclude":[...],"limit":50}}
-//!             {"version":2,"indexing":false}
-//!             {"version":2,"error":"unknown command: foo"}
+//!             {"version":3,"matches":[{"score":123,"path":"/Users/me/work/main.zig"}]}
+//!             {"version":3}
+//!             {"version":3,"config":{"include":[...],"exclude":[...],"limit":50}}
+//!             {"version":3,"indexing":false}
+//!             {"version":3,"error":"unknown command: foo"}
 //!             Matches are best first. Folder paths end with "/".
+//!   Search and status responses also have an "issues" field, only when something is wrong:
+//!             "issues":{"unreadable":12,"failed":0,"samples":["/Users/me/Library/Mail"]}
+//!             "unreadable" counts folders the daemon may not open (on macOS: no Full Disk
+//!             Access), whose files are missing from the results. "failed" counts other errors
+//!             that left the index incomplete or stale. "samples" lists a few unreadable folders,
+//!             shallowest first.
 //!   The config lives in a file the daemon alone writes, see config.zig.
 //!   Bump `protocol_version` when a change would break an older client; unknown fields in a
 //!   request are ignored, unknown commands get an error response.
@@ -28,12 +34,14 @@ const std = @import("std");
 const fileIndex = @import("file-index.zig");
 const indexer = @import("indexer.zig");
 const config = @import("config.zig");
+const issues = @import("issues.zig");
 
 var gpa: std.mem.Allocator = undefined;
 var io: std.Io = undefined;
 
 /// 2: the config, setConfig and status commands; the search limit defaults to the config's.
-pub const protocol_version = 2;
+/// 3: search and status responses carry an "issues" field when part of the tree could not be read.
+pub const protocol_version = 3;
 
 var store: *config.Store = undefined;
 
@@ -138,7 +146,9 @@ fn writeConfig(out: *std.Io.Writer, cfg: config.Config) std.Io.Writer.Error!void
 }
 
 fn writeStatus(out: *std.Io.Writer, indexing: bool) std.Io.Writer.Error!void {
-    try out.print("{{\"version\":{d},\"indexing\":{}}}\n", .{ protocol_version, indexing });
+    try out.print("{{\"version\":{d},\"indexing\":{}", .{ protocol_version, indexing });
+    try issues.writeJson(out, &issues.snapshot());
+    try out.writeAll("}\n");
     try out.flush();
 }
 
@@ -157,7 +167,9 @@ fn writeResults(out: *std.Io.Writer, results: []const fileIndex.SearchResult) st
         try std.json.Stringify.encodeJsonString(r.path, .{}, out);
         try out.writeAll("}");
     }
-    try out.writeAll("]}\n");
+    try out.writeAll("]");
+    try issues.writeJson(out, &issues.snapshot());
+    try out.writeAll("}\n");
     try out.flush();
 }
 

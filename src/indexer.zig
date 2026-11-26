@@ -5,6 +5,7 @@ const fileIndex = @import("file-index.zig");
 const watcher = @import("watcher.zig");
 const walk = @import("walk.zig");
 const config = @import("config.zig");
+const issues = @import("issues.zig");
 
 pub var index: *fileIndex.FileIndex = undefined;
 
@@ -14,7 +15,8 @@ var io: std.Io = undefined;
 fn scanFolder(path: []const u8, position: fileIndex.Position) !void {
     var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
         // Gone again, replaced by a file or a link, or not ours to read
-        error.FileNotFound, error.NotDir, error.SymLinkLoop, error.AccessDenied => return,
+        error.FileNotFound, error.NotDir, error.SymLinkLoop => return,
+        error.AccessDenied, error.PermissionDenied => return issues.record(.unreadable, path),
         else => return err,
     };
     defer dir.close(io);
@@ -73,11 +75,16 @@ fn rebuild() !void {
     walk.index = fresh;
     defer walk.index = index;
 
+    issues.begin();
+    var succeeded = false;
+    defer issues.end(succeeded);
+
     try fresh.beginBulk();
     _ = try walk.walk(filter.roots);
     try fresh.endBulk();
 
     index.swapTrie(fresh);
+    succeeded = true;
 }
 
 /// What dead space in the trie is worth a rebuild: it is only ever given back by one.
@@ -101,6 +108,7 @@ fn rescanIndex(path: []const u8) !void {
 
 fn reportIndexError(what: []const u8, path: []const u8, err: anyerror) void {
     std.debug.print("index: {s} {s} failed: {any}\n", .{ what, path, err });
+    issues.recordError(path, err);
 }
 
 fn onFsEvent(_: ?*anyopaque, event: watcher.Event) void {
@@ -132,6 +140,7 @@ pub fn start(allocator: std.mem.Allocator, theIo: std.Io, cfg: config.Config) !v
     io = theIo;
     walk.gpa = gpa;
     walk.io = io;
+    issues.init(io);
     filter = try config.Filter.init(gpa, cfg);
     walk.filter = &filter;
 
@@ -145,7 +154,12 @@ pub fn start(allocator: std.mem.Allocator, theIo: std.Io, cfg: config.Config) !v
     walk.index = index;
     // The walk adds into a plain trie, packed into the search trie once done
     try index.beginBulk();
-    const cnt = try walk.walk(filter.roots);
+    issues.begin();
+    const cnt = walk.walk(filter.roots) catch |err| {
+        issues.end(false);
+        return err;
+    };
+    issues.end(true);
     const walkedTime = std.Io.Clock.awake.now(io);
     try index.endBulk();
     const endTime = std.Io.Clock.awake.now(io);

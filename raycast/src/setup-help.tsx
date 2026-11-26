@@ -1,7 +1,7 @@
 import { Action, ActionPanel, Icon, List } from "@raycast/api";
 
 const REPO_URL = "https://github.com/StoyanMalinin/something";
-const BREW_FORMULA = "StoyanMalinin/tap/something-daemon";
+export const BREW_FORMULA = "StoyanMalinin/tap/something-daemon";
 
 const SETUP_STEPS = [
   { title: "Start the daemon", command: `brew services start ${BREW_FORMULA}`, icon: Icon.Play },

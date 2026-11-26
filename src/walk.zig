@@ -1,6 +1,7 @@
 const std = @import("std");
 const fileIndex = @import("file-index.zig");
 const config = @import("config.zig");
+const issues = @import("issues.zig");
 
 /// What to leave out. Set by the indexer before any walk.
 pub var filter: *const config.Filter = undefined;
@@ -27,7 +28,12 @@ pub fn walkSingleThreaded(dir: *std.Io.Dir, position: fileIndex.Position, path: 
         if (entry.kind == std.Io.File.Kind.directory) {
             var subDir: ?std.Io.Dir = dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false }) catch |err|
                 switch (err) {
-                    error.PermissionDenied, error.AccessDenied => null,
+                    error.PermissionDenied, error.AccessDenied => blk: {
+                        const subPath = try childPath(path, entry.name);
+                        defer gpa.free(subPath);
+                        issues.record(.unreadable, subPath);
+                        break :blk null;
+                    },
                     else => |leftoverErr| return leftoverErr,
                 };
 
@@ -70,6 +76,7 @@ fn walkWrapper(dir: *?std.Io.Dir, position: fileIndex.Position, path: []u8, mut:
 
     const currCnt = walkSingleThreaded(&dir.*.?, position, path) catch |walkErr| blk: {
         std.debug.print("Error: {any}\n", .{walkErr});
+        issues.recordError(path, walkErr);
         break :blk 0;
     };
 
@@ -122,6 +129,7 @@ pub fn walk(roots: []const []const u8) !i32 {
         const dir = try gpa.create(?std.Io.Dir);
         dir.* = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| {
             std.debug.print("walk: cannot open {s}: {any}\n", .{ root, err });
+            issues.recordError(root, err);
             gpa.destroy(dir);
             continue;
         };
@@ -161,7 +169,12 @@ pub fn walk(roots: []const []const u8) !i32 {
                 const subDir = try gpa.create(?std.Io.Dir);
                 subDir.* = item.dir.*.?.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false }) catch |err|
                     switch (err) {
-                        error.PermissionDenied => null,
+                        error.PermissionDenied, error.AccessDenied => blk: {
+                            const subPath = try childPath(item.path, entry.name);
+                            defer gpa.free(subPath);
+                            issues.record(.unreadable, subPath);
+                            break :blk null;
+                        },
                         else => |leftoverErr| return leftoverErr,
                     };
 
