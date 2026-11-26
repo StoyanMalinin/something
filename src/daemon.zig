@@ -83,6 +83,21 @@ fn handle(stream: std.Io.net.Stream) void {
     serve(stream) catch |err| std.debug.print("query failed: {any}\n", .{err});
 }
 
+/// The walk holds up to ~1000 folders open at once while it spreads them over threads.
+/// launchd starts jobs with a soft limit of 256 open files (a shell usually allows far
+/// more), so raise ours to what the hard limit allows, capped at macOS's OPEN_MAX: asking
+/// for more than that fails even when the hard limit is unlimited.
+fn raiseOpenFileLimit() void {
+    const wanted: std.posix.rlim_t = 10240;
+    var limits = std.posix.getrlimit(.NOFILE) catch return;
+    if (limits.cur >= wanted) return;
+
+    limits.cur = @min(wanted, limits.max);
+    std.posix.setrlimit(.NOFILE, limits) catch |err| {
+        std.debug.print("could not raise the open file limit: {any}\n", .{err});
+    };
+}
+
 pub fn main(init: std.process.Init) !void {
     gpa = init.gpa;
     io = init.io;
@@ -92,6 +107,7 @@ pub fn main(init: std.process.Init) !void {
     const root = try std.Io.Dir.cwd().realPathFileAlloc(io, if (args.len > 1) args[1] else "/", arena);
     const sockPath = try socketPath(arena, init.environ_map);
 
+    raiseOpenFileLimit();
     const fsWatcher = try indexer.start(gpa, io, root);
     defer fsWatcher.stop(gpa);
 

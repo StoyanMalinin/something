@@ -76,12 +76,38 @@ fn walkWrapper(dir: *?std.Io.Dir, position: fileIndex.Position, mut: *std.Io.Mut
     mut.*.unlock(io);
 }
 
+/// Threads that walk in parallel, the caller included. Measured on 10 cores (4 performance):
+/// going past 4 gained nothing, likely held back by the index's lock or the kernel.
+const walker_threads = 4;
+
+/// How many folders the single-threaded first pass splits the tree into (each held open
+/// until a walker takes it). Swept 4..4000 at 4 threads: below 256 one big folder is left
+/// to a single walker at the end (~1.7x slower on ~), above it the first pass grows too
+/// long; 256 tied 1000 with a quarter of the open files.
+const initial_dirs = 256;
+
+const DirQueue = std.PriorityQueue(MyDir, void, compareDir);
+
+const Queue = struct {
+    pq: *DirQueue,
+    /// Guards `pq` and `cnt`
+    mutex: *std.Io.Mutex,
+    cnt: *i32,
+};
+
+fn walker(queue: *Queue) void {
+    while (true) {
+        queue.mutex.lockUncancelable(io);
+        const next = queue.pq.pop();
+        queue.mutex.unlock(io);
+
+        const item = next orelse return;
+        walkWrapper(item.dir, item.position, queue.mutex, queue.cnt);
+    }
+}
+
 pub fn walk(path: []const u8) !i32 {
-    var pq = std.PriorityQueue(
-        MyDir,
-        void,
-        compareDir,
-    ).initContext({});
+    var pq = DirQueue.initContext({});
     defer pq.deinit(gpa);
 
     dataVolumeInode = if (std.Io.Dir.cwd().statFile(io, "/System/Volumes/Data", .{ .follow_symlinks = false })) |st| st.inode else |_| null;
@@ -96,7 +122,7 @@ pub fn walk(path: []const u8) !i32 {
     var mutex: std.Io.Mutex = .init;
 
     var explored: usize = 0;
-    while (explored + pq.count() < 1000 and pq.count() > 0) {
+    while (explored + pq.count() < initial_dirs and pq.count() > 0) {
         explored += 1;
 
         const item: MyDir = pq.pop().?;
@@ -132,19 +158,14 @@ pub fn walk(path: []const u8) !i32 {
         }
     }
 
+    // A fixed set of walkers take folders from the queue, largest first, until it is empty.
+    // The calling thread is one of them.
+    var queue: Queue = .{ .pq = &pq, .mutex = &mutex, .cnt = &cnt };
     var group: std.Io.Group = .init;
-
-    while (pq.count() > 0) {
-        const item = pq.pop().?;
-
-        group.async(io, walkWrapper, .{
-            item.dir,
-            item.position,
-            &mutex,
-            &cnt,
-        });
+    for (1..walker_threads) |_| {
+        group.concurrent(io, walker, .{&queue}) catch break;
     }
-
+    walker(&queue);
     try group.await(io);
 
     // The masks above each walker's starting position missed its adds
