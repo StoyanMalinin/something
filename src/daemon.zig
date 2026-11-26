@@ -1,19 +1,12 @@
-//! Keeps the index in memory and answers queries over a Unix socket.
+//! The part of the daemon that is allowed to do dangerous things: write to disk and open
+//! sockets. It binds the socket, enters the sandbox, and only then hands the socket to `server`,
+//! which indexes the tree and answers queries; from that point the process can only read.
 //!
 //! Usage: something-daemon [root]   (root defaults to /)
 //! Socket: $SOMETHING_SOCKET, or ~/Library/Caches/something/daemon.sock
-//!
-//! Protocol, one query per connection:
-//!   request:  "<limit>\t<query>\n"   (or just "<query>\n" for the default limit)
-//!   response: one JSON object per line, best match first, then the server closes:
-//!             {"score":123,"path":"/Users/me/work/main.zig"}
-//!             Folder paths end with "/".
 const std = @import("std");
-const fileIndex = @import("file-index.zig");
-const indexer = @import("indexer.zig");
-
-const default_limit = 50;
-const max_limit = 1000;
+const sandbox = @import("sandbox.zig");
+const server = @import("server.zig");
 
 var gpa: std.mem.Allocator = undefined;
 var io: std.Io = undefined;
@@ -31,85 +24,13 @@ fn socketPath(arena: std.mem.Allocator, env: *const std.process.Environ.Map) ![]
     return std.fs.path.join(arena, &.{ dir, "daemon.sock" });
 }
 
-fn parseRequest(line: []const u8) struct { limit: usize, query: []const u8 } {
-    if (std.mem.indexOfScalar(u8, line, '\t')) |tab| {
-        if (std.fmt.parseInt(usize, line[0..tab], 10)) |limit| {
-            return .{ .limit = std.math.clamp(limit, 1, max_limit), .query = line[tab + 1 ..] };
-        } else |_| {}
-    }
-    return .{ .limit = default_limit, .query = line };
-}
-
-fn serve(stream: std.Io.net.Stream) !void {
-    var inBuf: [4096]u8 = undefined;
-    var reader = stream.reader(io, &inBuf);
-    var outBuf: [16 * 1024]u8 = undefined;
-    var writer = stream.writer(io, &outBuf);
-
-    const line = (reader.interface.takeDelimiter('\n') catch |err| switch (err) {
-        error.ReadFailed => return if (clientLeft(reader.err.?)) {} else reader.err.?,
-        else => return err,
-    }) orelse return;
-    const request = parseRequest(line);
-    const query = std.mem.trim(u8, request.query, " \t\r");
-    if (query.len == 0) return;
-
-    const results = try indexer.index.search(gpa, query, .{ .limit = request.limit });
-    defer fileIndex.freeSearchResults(gpa, results);
-
-    writeResults(&writer.interface, results) catch {
-        // WriteFailed hides the cause, which the stream keeps
-        return if (clientLeft(writer.err.?)) {} else writer.err.?;
-    };
-}
-
-/// The client hung up before reading everything: Raycast does this to every query a
-/// newer keystroke replaces. EPIPE surfaces as SocketUnconnected.
-fn clientLeft(err: anyerror) bool {
-    return err == error.SocketUnconnected or err == error.ConnectionResetByPeer;
-}
-
-fn writeResults(out: *std.Io.Writer, results: []const fileIndex.SearchResult) std.Io.Writer.Error!void {
-    for (results) |r| {
-        try out.print("{{\"score\":{d},\"path\":", .{r.score});
-        try std.json.Stringify.encodeJsonString(r.path, .{}, out);
-        try out.writeAll("}\n");
-    }
-    try out.flush();
-}
-
-fn handle(stream: std.Io.net.Stream) void {
-    defer stream.close(io);
-    serve(stream) catch |err| std.debug.print("query failed: {any}\n", .{err});
-}
-
-/// The walk holds up to ~1000 folders open at once while it spreads them over threads.
-/// launchd starts jobs with a soft limit of 256 open files (a shell usually allows far
-/// more), so raise ours to what the hard limit allows, capped at macOS's OPEN_MAX: asking
-/// for more than that fails even when the hard limit is unlimited.
-fn raiseOpenFileLimit() void {
-    const wanted: std.posix.rlim_t = 10240;
-    var limits = std.posix.getrlimit(.NOFILE) catch return;
-    if (limits.cur >= wanted) return;
-
-    limits.cur = @min(wanted, limits.max);
-    std.posix.setrlimit(.NOFILE, limits) catch |err| {
-        std.debug.print("could not raise the open file limit: {any}\n", .{err});
-    };
-}
-
-pub fn main(init: std.process.Init) !void {
-    gpa = init.gpa;
-    io = init.io;
+/// Everything that needs to write to disk or open sockets: create the socket directory,
+/// remove a stale socket, bind. The indexer and the file watcher only read, so they start
+/// after the sandbox is entered. Connections made while it indexes wait in the socket's
+/// backlog until `server.run` starts accepting.
+fn bindSocket(init: std.process.Init) !std.Io.net.Server {
     const arena = init.arena.allocator();
-
-    const args = try init.minimal.args.toSlice(arena);
-    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, if (args.len > 1) args[1] else "/", arena);
     const sockPath = try socketPath(arena, init.environ_map);
-
-    raiseOpenFileLimit();
-    const fsWatcher = try indexer.start(gpa, io, root);
-    defer fsWatcher.stop(gpa);
 
     // Left behind by an earlier run that did not shut down cleanly
     std.Io.Dir.cwd().deleteFile(io, sockPath) catch |err| switch (err) {
@@ -122,19 +43,34 @@ pub fn main(init: std.process.Init) !void {
         return error.NameTooLong;
     }
     const address = try std.Io.net.UnixAddress.init(sockPath);
-    var server = try address.listen(io, .{});
-    defer server.deinit(io);
+    const listener = try address.listen(io, .{});
     std.debug.print("Listening on {s}\n", .{sockPath});
+    return listener;
+}
 
-    var group: std.Io.Group = .init;
-    defer group.cancel(io);
+/// Gives up network and disk writes for the rest of the process's life. SOMETHING_NO_SANDBOX
+/// is an escape hatch for debugging (profilers and tracers write files).
+fn enterSandbox(init: std.process.Init) !void {
+    if (init.environ_map.get("SOMETHING_NO_SANDBOX") != null) return;
+    try sandbox.enter();
+    std.debug.print("Sandboxed: no network, no disk writes\n", .{});
+}
 
-    while (true) {
-        const stream = server.accept(io) catch |err| switch (err) {
-            error.ConnectionAborted => continue,
-            else => return err,
-        };
-        // A slow client must not hold up the others
-        group.concurrent(io, handle, .{stream}) catch handle(stream);
-    }
+pub fn main(init: std.process.Init) !void {
+    gpa = init.gpa;
+    io = init.io;
+    const arena = init.arena.allocator();
+
+    const args = try init.minimal.args.toSlice(arena);
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, if (args.len > 1) args[1] else "/", arena);
+
+    var listener = try bindSocket(init);
+    defer listener.deinit(io);
+
+    try enterSandbox(init);
+
+    // From here on the process can only read
+    var srv = try server.Server.start(gpa, io, root);
+    defer srv.stop();
+    try srv.serve(&listener);
 }
